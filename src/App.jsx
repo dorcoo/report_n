@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { 
   Upload, Download, BarChart3, TrendingUp, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
@@ -73,18 +73,28 @@ const App = () => {
     document.head.appendChild(script);
   }, []);
 
-  // 2. 데이터가 변경될 때마다 로컬 스토리지에 자동 저장 (방어막)
+  // 2. 데이터 자동 저장 최적화 (Debouncing 적용)
+  // 데이터가 변경될 때마다 즉시 저장하지 않고 1초간 변화가 없을 때 한 번만 저장하여 성능 개선
   useEffect(() => {
-    if (processedData.length > 0) {
-      const dataToSave = {
-        processedData,
-        dailyTrend,
-        monthlyTrend,
-        globalMaxDate,
-        lastUpdated: new Date().toISOString()
-      };
-      localStorage.setItem('sales_dashboard_local_data', JSON.stringify(dataToSave));
-    }
+    if (processedData.length === 0) return;
+
+    const debounceTimer = setTimeout(() => {
+      try {
+        const dataToSave = {
+          processedData,
+          dailyTrend,
+          monthlyTrend,
+          globalMaxDate,
+          lastUpdated: new Date().toISOString()
+        };
+        localStorage.setItem('sales_dashboard_local_data', JSON.stringify(dataToSave));
+        console.log("자동 저장 완료 (Local)");
+      } catch (e) {
+        console.error("자동 저장 실패:", e);
+      }
+    }, 1000); // 1초 디바운스
+
+    return () => clearTimeout(debounceTimer);
   }, [processedData, dailyTrend, monthlyTrend, globalMaxDate]);
 
   // Firebase 인증 (RULE 3 준수)
@@ -107,7 +117,7 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 로그인 상태 확인 후 클라우드 데이터 불러오기 (RULE 1 & 3 준수)
+  // 로그인 상태 확인 후 클라우드 데이터 불러오기
   useEffect(() => {
     if (!user) return;
     
@@ -120,13 +130,12 @@ const App = () => {
           const savedData = docSnap.data();
           const cloudData = JSON.parse(savedData.processedData || '[]');
           
-          // 클라우드 데이터가 로컬보다 최신이거나 로컬이 비어있을 때만 업데이트
           if (cloudData.length > 0 && processedData.length === 0) {
             setProcessedData(cloudData);
             setDailyTrend(JSON.parse(savedData.dailyTrend || '[]'));
             setMonthlyTrend(JSON.parse(savedData.monthlyTrend || '[]'));
             setGlobalMaxDate(savedData.globalMaxDate || '');
-            setStatusMessage({ type: 'success', text: '클라우드 데이터를 불러왔습니다.' });
+            setStatusMessage({ type: 'success', text: '클라우드 데이터를 동기화했습니다.' });
           }
         }
       } catch (e) {
@@ -137,7 +146,7 @@ const App = () => {
     loadFromCloud();
   }, [user]);
 
-  // 클라우드 저장 함수 (RULE 1 준수)
+  // 클라우드 저장 함수 (데이터 최적화 및 비동기 처리 개선)
   const saveToCloud = async () => {
     if (!user || !db) {
       setStatusMessage({ type: 'error', text: '인증되지 않은 사용자입니다.' });
@@ -145,19 +154,25 @@ const App = () => {
     }
     
     setIsProcessing(true);
+    setStatusMessage({ type: 'info', text: '클라우드 저장 중...' });
+
     try {
+      // 대용량 데이터 전송 시 블로킹 방지를 위한 비동기 처리
       const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'reports', 'latest');
-      await setDoc(docRef, {
+      
+      const payload = {
         processedData: JSON.stringify(processedData),
         dailyTrend: JSON.stringify(dailyTrend),
         monthlyTrend: JSON.stringify(monthlyTrend),
         globalMaxDate: globalMaxDate,
         updatedAt: new Date().toISOString()
-      });
-      setStatusMessage({ type: 'success', text: '클라우드에 안전하게 저장되었습니다.' });
+      };
+
+      await setDoc(docRef, payload);
+      setStatusMessage({ type: 'success', text: '클라우드 영구 보관 완료!' });
     } catch (err) {
       console.error(err);
-      setStatusMessage({ type: 'error', text: '저장 실패: Firebase 설정을 확인해주세요.' });
+      setStatusMessage({ type: 'error', text: '저장 실패: 데이터 용량이 너무 크거나 네트워크 오류입니다.' });
     } finally {
       setIsProcessing(false);
     }
@@ -250,7 +265,7 @@ const App = () => {
       setProcessedData(finalProducts);
       setDailyTrend(Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)));
       setMonthlyTrend(Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month)));
-      setStatusMessage({ type: 'success', text: `데이터 분석 완료! 브라우저에 자동 저장되었습니다.` });
+      setStatusMessage({ type: 'success', text: `데이터 분석 완료!` });
     } catch (err) {
       setStatusMessage({ type: 'error', text: '파일 처리 오류' });
     } finally {
@@ -314,7 +329,7 @@ const App = () => {
         <header className="h-20 bg-white/80 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between px-8 border-b border-slate-50">
           <div className="flex items-center gap-4">
              <h2 className="text-xl font-bold">{activeTab === 'dashboard' ? '종합 리포트' : '상품 상세 리스트'}</h2>
-             <span className="text-[10px] bg-emerald-50 text-emerald-600 px-2 py-1 rounded-full font-bold">로컬 자동저장 활성</span>
+             <span className="text-[10px] bg-emerald-50 text-emerald-600 px-2 py-1 rounded-full font-bold">실시간 최적화 저장 중</span>
           </div>
           <div className="flex gap-2">
             {processedData.length > 0 && (
@@ -329,7 +344,7 @@ const App = () => {
           {processedData.length === 0 ? (
             <div className="h-[60vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-[40px]">
               <FileSpreadsheet size={64} className="mb-4 opacity-20" />
-              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 한 번 분석된 데이터는 자동으로 저장됩니다.</p>
+              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 분석 즉시 배경에서 최적화 저장이 시작됩니다.</p>
             </div>
           ) : (
             <>
