@@ -42,7 +42,7 @@ const App = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [showOnlyNameChanged, setShowOnlyNameChanged] = useState(false);
-  const [sortConfig, setSortConfig] = useState({ key: '결제금액', direction: 'desc' });
+  const [sortConfig, setSortConfig] = useState({ key: '상품상세조회수', direction: 'desc' });
   const [statusMessage, setStatusMessage] = useState(null);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -175,7 +175,7 @@ const App = () => {
     }
   };
 
-  // 엑셀 분석 로직
+  // 엑셀 분석 로직 (누적을 위한 Merge 로직 포함)
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -205,15 +205,40 @@ const App = () => {
     if (!isLibLoaded) return;
     setIsProcessing(true);
     
+    // 1. 기존 데이터로 Map 복원 (누적의 핵심)
     const productMap = new Map();
     const dailyMap = new Map();
     const monthlyMap = new Map();
     const productDailyHistory = new Map();
-    let currentMaxDate = '';
+    let currentMaxDate = globalMaxDate;
+
+    // 기존 상품 정보 복원
+    processedData.forEach(p => {
+      productMap.set(p.상품ID, { 
+        ...p, 
+        // 합산을 위해 누적 수치는 유지하고 history는 나중에 재구성
+      });
+      // 히스토리 복원
+      productDailyHistory.set(p.상품ID, [...(p.history || [])]);
+    });
+
+    // 기존 일별 트렌드 복원
+    dailyTrend.forEach(d => {
+      dailyMap.set(d.date, { ...d });
+    });
+
+    // 기존 월별 트렌드 복원
+    monthlyTrend.forEach(m => {
+      monthlyMap.set(m.month, { ...m });
+    });
 
     try {
       for (const file of targetFiles) {
         const dateStr = extractDate(file.name);
+        
+        // 날짜 중복 체크 (이미 처리된 날짜의 파일이면 스킵하거나 덮어쓰기 로직 필요)
+        // 여기서는 동일 날짜 파일이 중복 업로드되면 수치가 더해지므로 주의 필요
+        
         if (dateStr !== '알 수 없는 날짜' && dateStr > currentMaxDate) currentMaxDate = dateStr;
         const monthStr = dateStr !== '알 수 없는 날짜' ? dateStr.substring(0, 7) : '알 수 없는 월';
         const data = await parseExcel(file);
@@ -229,42 +254,105 @@ const App = () => {
           const views = Number(item['상품상세조회수']) || 0;
           const sales = Number(item['결제상품수량']) || 0;
 
+          // 상품 정보 업데이트
           if (!productMap.has(pid)) {
-            productMap.set(pid, { ...item, 상품ID: pid, 결제금액: revenue, 상품상세조회수: views, 결제상품수량: sales, nameHistory: [{ name: currentName, start: dateStr, end: dateStr }], lastName: currentName, nameCount: 1 });
+            productMap.set(pid, { 
+              ...item, 
+              상품ID: pid, 
+              결제금액: revenue, 
+              상품상세조회수: views, 
+              결제상품수량: sales, 
+              nameHistory: [{ name: currentName, start: dateStr, end: dateStr }], 
+              lastName: currentName, 
+              nameCount: 1 
+            });
           } else {
             const p = productMap.get(pid);
-            p.결제금액 += revenue; p.상품상세조회수 += views; p.결제상품수량 += sales;
+            p.결제금액 += revenue; 
+            p.상품상세조회수 += views; 
+            p.결제상품수량 += sales;
+            
+            // 이름 이력 관리
             let nr = p.nameHistory.find(nh => nh.name === currentName);
-            if (!nr) { p.nameHistory.push({ name: currentName, start: dateStr, end: dateStr }); p.nameCount = p.nameHistory.length; p.lastName = currentName; }
-            else { if (dateStr < nr.start) nr.start = dateStr; if (dateStr > nr.end) nr.end = dateStr; }
+            if (!nr) { 
+              p.nameHistory.push({ name: currentName, start: dateStr, end: dateStr }); 
+              p.nameCount = p.nameHistory.length; 
+              p.lastName = currentName; 
+            } else { 
+              if (dateStr < nr.start) nr.start = dateStr; 
+              if (dateStr > nr.end) nr.end = dateStr; 
+            }
           }
-          dailyMap.get(dateStr).매출 += revenue; dailyMap.get(dateStr).조회수 += views; dailyMap.get(dateStr).판매량 += sales;
-          monthlyMap.get(monthStr).매출 += revenue; monthlyMap.get(monthStr).조회수 += views; monthlyMap.get(monthStr).판매량 += sales;
+
+          // 일별/월별 집계
+          dailyMap.get(dateStr).매출 += revenue; 
+          dailyMap.get(dateStr).조회수 += views; 
+          dailyMap.get(dateStr).판매량 += sales;
+          
+          monthlyMap.get(monthStr).매출 += revenue; 
+          monthlyMap.get(monthStr).조회수 += views; 
+          monthlyMap.get(monthStr).판매량 += sales;
+
+          // 상품별 일자 히스토리 누적
           if (!productDailyHistory.has(pid)) productDailyHistory.set(pid, []);
-          productDailyHistory.get(pid).push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: currentName });
+          const pHistory = productDailyHistory.get(pid);
+          
+          // 동일 날짜 데이터가 이미 있다면 합산, 없다면 추가
+          const existingDay = pHistory.find(h => h.date === dateStr);
+          if (existingDay) {
+            existingDay.매출 += revenue;
+            existingDay.조회수 += views;
+            existingDay.판매량 += sales;
+          } else {
+            pHistory.push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: currentName });
+          }
         });
       }
 
       setGlobalMaxDate(currentMaxDate);
+      
+      // 최종 데이터 가공
       const finalProducts = Array.from(productMap.values()).map(p => {
         const history = (productDailyHistory.get(p.상품ID) || []).sort((a, b) => a.date.localeCompare(b.date));
+        
         const performanceByName = p.nameHistory.map(nh => {
           const nameData = history.filter(h => h.nameUsed === nh.name);
           const tRev = nameData.reduce((s, h) => s + h.매출, 0);
           const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
           const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
-          const days = Math.ceil(Math.abs(new Date(nh.end) - new Date(nh.start)) / (1000 * 60 * 60 * 24)) + 1;
-          return { name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews, dailyAvgViews: tViews / days, cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, days, periodStart: nh.start, periodEnd: nh.end };
+          
+          const startDate = new Date(nh.start);
+          const endDate = new Date(nh.end);
+          const days = Math.ceil(Math.abs(endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+          
+          return { 
+            name: nh.name, 
+            totalRevenue: tRev, 
+            totalSales: tSales, 
+            totalViews: tViews, 
+            dailyAvgViews: tViews / days, 
+            cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, 
+            days, 
+            periodStart: nh.start, 
+            periodEnd: nh.end 
+          };
         }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
-        return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
+
+        return { 
+          ...p, 
+          상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, 
+          history, 
+          performanceByName 
+        };
       });
 
       setProcessedData(finalProducts);
       setDailyTrend(Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)));
       setMonthlyTrend(Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month)));
-      setStatusMessage({ type: 'success', text: `데이터 분석 완료!` });
+      setStatusMessage({ type: 'success', text: `데이터가 성공적으로 누적 분석되었습니다.` });
     } catch (err) {
-      setStatusMessage({ type: 'error', text: '파일 처리 오류' });
+      console.error(err);
+      setStatusMessage({ type: 'error', text: '파일 처리 중 오류가 발생했습니다.' });
     } finally {
       setIsProcessing(false);
     }
@@ -274,13 +362,34 @@ const App = () => {
     const totalRevenue = processedData.reduce((acc, curr) => acc + curr.결제금액, 0);
     const totalSales = processedData.reduce((acc, curr) => acc + curr.결제상품수량, 0);
     const totalViews = processedData.reduce((acc, curr) => acc + curr.상품상세조회수, 0);
-    return { revenue: totalRevenue, sales: totalSales, views: totalViews, dailyAvgViews: dailyTrend.length > 0 ? totalViews / dailyTrend.length : 0, conversionRate: totalViews > 0 ? (totalSales / totalViews) * 100 : 0 };
+    return { 
+      revenue: totalRevenue, 
+      sales: totalSales, 
+      views: totalViews, 
+      dailyAvgViews: dailyTrend.length > 0 ? totalViews / dailyTrend.length : 0, 
+      conversionRate: totalViews > 0 ? (totalSales / totalViews) * 100 : 0 
+    };
   }, [processedData, dailyTrend]);
 
   const sortedData = useMemo(() => {
     let filtered = processedData.filter(p => (p.lastName.includes(searchTerm) || p.상품ID.includes(searchTerm)) && (showOnlyNameChanged ? p.nameCount > 1 : true));
-    return filtered.sort((a, b) => (b[sortConfig.key] || 0) - (a[sortConfig.key] || 0));
+    
+    if (sortConfig.key) {
+      filtered.sort((a, b) => {
+        const aVal = a[sortConfig.key] || 0;
+        const bVal = b[sortConfig.key] || 0;
+        return sortConfig.direction === 'asc' ? aVal - bVal : bVal - aVal;
+      });
+    }
+    return filtered;
   }, [processedData, searchTerm, showOnlyNameChanged, sortConfig]);
+
+  const handleSort = (key) => {
+    setSortConfig(prev => ({
+      key,
+      direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc'
+    }));
+  };
 
   const clearData = () => {
     if (confirm("모든 데이터를 삭제하시겠습니까? 로컬 저장소에서도 삭제됩니다.")) {
@@ -326,7 +435,7 @@ const App = () => {
         <header className="h-20 bg-white/80 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between px-8 border-b border-slate-50">
           <div className="flex items-center gap-4">
              <h2 className="text-xl font-bold">{activeTab === 'dashboard' ? '종합 리포트' : '상품 상세 리스트'}</h2>
-             <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-1 rounded-full font-bold uppercase tracking-wider">조회수 중심 분석 모드</span>
+             <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-1 rounded-full font-bold uppercase tracking-wider">조회수 중심 누적 분석</span>
           </div>
           <div className="flex gap-2">
             {processedData.length > 0 && (
@@ -341,7 +450,7 @@ const App = () => {
           {processedData.length === 0 ? (
             <div className="h-[60vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-[40px]">
               <FileSpreadsheet size={64} className="mb-4 opacity-20" />
-              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 유입 데이터 분석을 시작합니다.</p>
+              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 추가 업로드 시 데이터가 계속 누적됩니다.</p>
             </div>
           ) : (
             <>
@@ -361,9 +470,7 @@ const App = () => {
 
               {activeTab === 'dashboard' ? (
                 <div className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-700">
-                  {/* 월간 성장 추이 그리드 */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    {/* 월간 매출 & 판매량 */}
                     <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm">
                       <h3 className="font-bold mb-6 flex items-center gap-2"><div className="w-1.5 h-5 bg-indigo-600 rounded-full"></div> 월간 매출 성장</h3>
                       <div className="h-64">
@@ -380,7 +487,6 @@ const App = () => {
                       </div>
                     </div>
 
-                    {/* 월간 조회수 성장 (중요 강조) */}
                     <div className="bg-white p-8 rounded-[32px] border border-blue-100 shadow-lg shadow-blue-50/50">
                       <h3 className="font-bold mb-6 flex items-center gap-2 text-blue-600"><div className="w-1.5 h-5 bg-blue-500 rounded-full"></div> 월간 조회수 성장</h3>
                       <div className="h-64">
@@ -397,13 +503,9 @@ const App = () => {
                     </div>
                   </div>
 
-                  {/* 일별 조회수 시계열 (대형) */}
                   <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm">
                     <div className="flex items-center justify-between mb-8">
                        <h3 className="font-bold flex items-center gap-2"><div className="w-1.5 h-5 bg-blue-400 rounded-full"></div> 일별 유입(조회수) 상세 흐름</h3>
-                       <div className="flex items-center gap-4 text-[11px] font-bold text-slate-400 uppercase tracking-widest">
-                          <div className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-blue-400"></div> Daily Views</div>
-                       </div>
                     </div>
                     <div className="h-80">
                       <ResponsiveContainer width="100%" height="100%">
@@ -433,31 +535,50 @@ const App = () => {
                     </div>
                     <button onClick={() => setShowOnlyNameChanged(!showOnlyNameChanged)} className={`px-6 rounded-2xl font-bold text-sm transition-all ${showOnlyNameChanged ? 'bg-indigo-600 text-white' : 'bg-white text-slate-400 border border-slate-100'}`}>명칭 변경 상품</button>
                   </div>
-                  <table className="w-full text-left">
-                    <thead>
-                      <tr className="border-b border-slate-50 text-[11px] font-bold text-slate-400 uppercase tracking-widest">
-                        <th className="p-6">상품정보</th>
-                        <th className="p-6">매출액</th>
-                        <th className="p-6">전환율</th>
-                        <th className="p-6 text-center">상세</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-50">
-                      {sortedData.map((item, idx) => (
-                        <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer" onClick={() => setSelectedProduct(item)}>
-                          <td className="p-6">
-                            <div className="font-bold text-slate-900 flex items-center gap-2">
-                              {item.lastName} {item.nameCount > 1 && <span className="bg-amber-100 text-amber-600 text-[10px] px-2 py-0.5 rounded-full">변경</span>}
-                            </div>
-                            <div className="text-[10px] text-slate-400">ID: {item.상품ID}</div>
-                          </td>
-                          <td className="p-6 font-black text-slate-700">₩{item.결제금액.toLocaleString()}</td>
-                          <td className="p-6 font-bold text-emerald-600">{(item.상세조회대비결제율 * 100).toFixed(2)}%</td>
-                          <td className="p-6 text-center text-slate-300"><ChevronRight size={18} /></td>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="border-b border-slate-50 text-[11px] font-bold text-slate-400 uppercase tracking-widest">
+                          <th className="p-6">상품정보</th>
+                          {[
+                            { label: '조회수', key: '상품상세조회수' },
+                            { label: '주문량', key: '결제상품수량' },
+                            { label: '매출액', key: '결제금액' },
+                            { label: '전환율', key: '상세조회대비결제율' }
+                          ].map(col => (
+                            <th 
+                              key={col.key} 
+                              className="p-6 cursor-pointer hover:text-indigo-600 transition-colors"
+                              onClick={() => handleSort(col.key)}
+                            >
+                              <div className="flex items-center gap-1">
+                                {col.label}
+                                <ArrowUpDown size={12} className={sortConfig.key === col.key ? 'text-indigo-600' : 'text-slate-200'} />
+                              </div>
+                            </th>
+                          ))}
+                          <th className="p-6 text-center">상세</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {sortedData.map((item, idx) => (
+                          <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer" onClick={() => setSelectedProduct(item)}>
+                            <td className="p-6 min-w-[200px]">
+                              <div className="font-bold text-slate-900 flex items-center gap-2">
+                                {item.lastName} {item.nameCount > 1 && <span className="bg-amber-100 text-amber-600 text-[10px] px-2 py-0.5 rounded-full">변경</span>}
+                              </div>
+                              <div className="text-[10px] text-slate-400">ID: {item.상품ID}</div>
+                            </td>
+                            <td className="p-6 font-bold text-slate-600">{item.상품상세조회수.toLocaleString()}</td>
+                            <td className="p-6 font-bold text-slate-600">{item.결제상품수량.toLocaleString()}</td>
+                            <td className="p-6 font-black text-slate-900 whitespace-nowrap">₩{item.결제금액.toLocaleString()}</td>
+                            <td className="p-6 font-bold text-emerald-600">{(item.상세조회대비결제율 * 100).toFixed(2)}%</td>
+                            <td className="p-6 text-center text-slate-300"><ChevronRight size={18} /></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
             </>
@@ -479,16 +600,12 @@ const App = () => {
                   <p className="text-xs text-slate-400 font-bold mt-1 tracking-widest uppercase">ID: {selectedProduct.상품ID}</p>
                 </div>
               </div>
-              <button 
-                onClick={() => setSelectedProduct(null)} 
-                className="w-12 h-12 bg-slate-50 hover:bg-white hover:shadow-lg rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100"
-              >
+              <button onClick={() => setSelectedProduct(null)} className="w-12 h-12 bg-slate-50 hover:bg-white hover:shadow-lg rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100">
                 <X size={20} />
               </button>
             </div>
             
             <div className="flex-1 overflow-y-auto p-10 space-y-12">
-              {/* 통계 카드 */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
                 {[
                   { label: '누적 유입수', val: `${selectedProduct.상품상세조회수}회` },
@@ -503,7 +620,6 @@ const App = () => {
                 ))}
               </div>
 
-              {/* 명칭 변경 분석 */}
               {selectedProduct.nameCount > 1 && (
                 <div className="space-y-6">
                   <div className="flex items-center gap-3">
@@ -541,7 +657,6 @@ const App = () => {
                 </div>
               )}
 
-              {/* 유입 추이 차트 */}
               <div className="space-y-6">
                 <div className="flex items-center gap-3">
                     <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600"><Eye size={16} /></div>
