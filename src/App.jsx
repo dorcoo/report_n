@@ -74,7 +74,6 @@ const App = () => {
   }, []);
 
   // 2. 데이터 자동 저장 최적화 (Debouncing 적용)
-  // 데이터가 변경될 때마다 즉시 저장하지 않고 1초간 변화가 없을 때 한 번만 저장하여 성능 개선
   useEffect(() => {
     if (processedData.length === 0) return;
 
@@ -88,16 +87,15 @@ const App = () => {
           lastUpdated: new Date().toISOString()
         };
         localStorage.setItem('sales_dashboard_local_data', JSON.stringify(dataToSave));
-        console.log("자동 저장 완료 (Local)");
       } catch (e) {
         console.error("자동 저장 실패:", e);
       }
-    }, 1000); // 1초 디바운스
+    }, 1000);
 
     return () => clearTimeout(debounceTimer);
   }, [processedData, dailyTrend, monthlyTrend, globalMaxDate]);
 
-  // Firebase 인증 (RULE 3 준수)
+  // Firebase 인증
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -146,7 +144,7 @@ const App = () => {
     loadFromCloud();
   }, [user]);
 
-  // 클라우드 저장 함수 (데이터 최적화 및 비동기 처리 개선)
+  // 클라우드 저장 함수
   const saveToCloud = async () => {
     if (!user || !db) {
       setStatusMessage({ type: 'error', text: '인증되지 않은 사용자입니다.' });
@@ -157,7 +155,6 @@ const App = () => {
     setStatusMessage({ type: 'info', text: '클라우드 저장 중...' });
 
     try {
-      // 대용량 데이터 전송 시 블로킹 방지를 위한 비동기 처리
       const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'reports', 'latest');
       
       const payload = {
@@ -329,7 +326,7 @@ const App = () => {
         <header className="h-20 bg-white/80 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between px-8 border-b border-slate-50">
           <div className="flex items-center gap-4">
              <h2 className="text-xl font-bold">{activeTab === 'dashboard' ? '종합 리포트' : '상품 상세 리스트'}</h2>
-             <span className="text-[10px] bg-emerald-50 text-emerald-600 px-2 py-1 rounded-full font-bold">실시간 최적화 저장 중</span>
+             <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-1 rounded-full font-bold uppercase tracking-wider">조회수 중심 분석 모드</span>
           </div>
           <div className="flex gap-2">
             {processedData.length > 0 && (
@@ -344,37 +341,87 @@ const App = () => {
           {processedData.length === 0 ? (
             <div className="h-[60vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-[40px]">
               <FileSpreadsheet size={64} className="mb-4 opacity-20" />
-              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 분석 즉시 배경에서 최적화 저장이 시작됩니다.</p>
+              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 유입 데이터 분석을 시작합니다.</p>
             </div>
           ) : (
             <>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                 {[
                   { label: '누적 매출', val: `₩${summary.revenue.toLocaleString()}`, color: 'indigo' },
-                  { label: '누적 판매', val: `${summary.sales.toLocaleString()}건`, color: 'emerald' },
+                  { label: '누적 유입수', val: `${summary.views.toLocaleString()}회`, color: 'blue' },
                   { label: '일평균 유입', val: `${summary.dailyAvgViews.toFixed(0)}회`, color: 'blue' },
                   { label: '전환율', val: `${summary.conversionRate.toFixed(2)}%`, color: 'rose' }
                 ].map((s, i) => (
-                  <div key={i} className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
-                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">{s.label}</p>
+                  <div key={i} className={`bg-white p-6 rounded-3xl border ${i === 1 || i === 2 ? 'border-blue-100 bg-blue-50/20' : 'border-slate-100'} shadow-sm`}>
+                    <p className={`text-[11px] font-bold ${i === 1 || i === 2 ? 'text-blue-500' : 'text-slate-400'} uppercase tracking-wider mb-1`}>{s.label}</p>
                     <p className={`text-2xl font-black text-slate-900`}>{s.val}</p>
                   </div>
                 ))}
               </div>
 
               {activeTab === 'dashboard' ? (
-                <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm">
-                  <h3 className="font-bold mb-6 flex items-center gap-2"><div className="w-1.5 h-5 bg-indigo-600 rounded-full"></div> 월간 성장 추이</h3>
-                  <div className="h-80">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={monthlyTrend}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                        <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94a3b8'}} />
-                        <YAxis hide />
-                        <Tooltip contentStyle={{borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)'}} />
-                        <Bar dataKey="매출" fill="#4f46e5" radius={[6, 6, 0, 0]} barSize={30} />
-                      </BarChart>
-                    </ResponsiveContainer>
+                <div className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-700">
+                  {/* 월간 성장 추이 그리드 */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    {/* 월간 매출 & 판매량 */}
+                    <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm">
+                      <h3 className="font-bold mb-6 flex items-center gap-2"><div className="w-1.5 h-5 bg-indigo-600 rounded-full"></div> 월간 매출 성장</h3>
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={monthlyTrend}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94a3b8'}} />
+                            <YAxis hide />
+                            <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)'}} />
+                            <Bar name="매출" dataKey="매출" fill="#4f46e5" radius={[6, 6, 0, 0]} barSize={24} />
+                            <Bar name="판매량" dataKey="판매량" fill="#cbd5e1" radius={[6, 6, 0, 0]} barSize={24} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    {/* 월간 조회수 성장 (중요 강조) */}
+                    <div className="bg-white p-8 rounded-[32px] border border-blue-100 shadow-lg shadow-blue-50/50">
+                      <h3 className="font-bold mb-6 flex items-center gap-2 text-blue-600"><div className="w-1.5 h-5 bg-blue-500 rounded-full"></div> 월간 조회수 성장</h3>
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={monthlyTrend}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94a3b8'}} />
+                            <YAxis hide />
+                            <Tooltip cursor={{fill: '#eff6ff'}} contentStyle={{borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)'}} />
+                            <Bar name="조회수" dataKey="조회수" fill="#3b82f6" radius={[6, 6, 0, 0]} barSize={40} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 일별 조회수 시계열 (대형) */}
+                  <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm">
+                    <div className="flex items-center justify-between mb-8">
+                       <h3 className="font-bold flex items-center gap-2"><div className="w-1.5 h-5 bg-blue-400 rounded-full"></div> 일별 유입(조회수) 상세 흐름</h3>
+                       <div className="flex items-center gap-4 text-[11px] font-bold text-slate-400 uppercase tracking-widest">
+                          <div className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-blue-400"></div> Daily Views</div>
+                       </div>
+                    </div>
+                    <div className="h-80">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={dailyTrend}>
+                          <defs>
+                            <linearGradient id="colorViewsMain" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.15}/>
+                              <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                          <XAxis dataKey="date" hide />
+                          <YAxis hide />
+                          <Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} />
+                          <Area type="monotone" dataKey="조회수" stroke="#3b82f6" strokeWidth={4} fillOpacity={1} fill="url(#colorViewsMain)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -418,8 +465,117 @@ const App = () => {
         </div>
       </main>
 
+      {/* 상품별 상세 분석 모달 */}
+      {selectedProduct && (
+        <div className="fixed inset-0 bg-slate-900/10 backdrop-blur-3xl z-50 flex items-center justify-center p-8 animate-in fade-in duration-300">
+          <div className="bg-white w-full max-w-6xl max-h-[92vh] rounded-[48px] shadow-2xl border border-white flex flex-col overflow-hidden animate-in zoom-in-95 duration-500">
+            <div className="px-10 py-10 flex items-center justify-between border-b border-slate-50">
+              <div className="flex items-center gap-6">
+                <div className="bg-blue-600 p-4 rounded-2xl text-white shrink-0">
+                  <Eye size={28} />
+                </div>
+                <div>
+                  <h3 className="text-2xl font-bold text-slate-900 leading-tight">{selectedProduct.lastName}</h3>
+                  <p className="text-xs text-slate-400 font-bold mt-1 tracking-widest uppercase">ID: {selectedProduct.상품ID}</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setSelectedProduct(null)} 
+                className="w-12 h-12 bg-slate-50 hover:bg-white hover:shadow-lg rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-10 space-y-12">
+              {/* 통계 카드 */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
+                {[
+                  { label: '누적 유입수', val: `${selectedProduct.상품상세조회수}회` },
+                  { label: '누적 매출액', val: `₩${selectedProduct.결제금액.toLocaleString()}` },
+                  { label: '누적 주문량', val: `${selectedProduct.결제상품수량}건` },
+                  { label: '평균 전환율', val: `${(selectedProduct.상세조회대비결제율 * 100).toFixed(2)}%` }
+                ].map((stat, i) => (
+                  <div key={i} className={`p-6 rounded-3xl border ${i === 0 ? 'bg-blue-50 border-blue-100' : 'bg-slate-50/50 border-slate-50'}`}>
+                    <p className={`text-[10px] font-bold ${i === 0 ? 'text-blue-500' : 'text-slate-400'} uppercase tracking-widest mb-1`}>{stat.label}</p>
+                    <p className="text-xl font-black text-slate-900 tracking-tight">{stat.val}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* 명칭 변경 분석 */}
+              {selectedProduct.nameCount > 1 && (
+                <div className="space-y-6">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600"><History size={16} /></div>
+                    <h4 className="text-lg font-bold text-slate-900">상품명 변경에 따른 유입 성과 비교</h4>
+                  </div>
+                  <div className="bg-white rounded-[32px] border border-slate-100 overflow-hidden shadow-sm">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="bg-slate-50/50 text-[10px] font-bold text-slate-400 uppercase">
+                          <th className="px-8 py-4">상품명</th>
+                          <th className="px-4 py-4 text-center">기간</th>
+                          <th className="px-4 py-4 text-right text-blue-600">총 조회수</th>
+                          <th className="px-4 py-4 text-right">매출액</th>
+                          <th className="px-4 py-4 text-right">일평균 유입</th>
+                          <th className="px-8 py-4 text-right">전환율</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {selectedProduct.performanceByName.map((p, i) => (
+                          <tr key={i} className="hover:bg-slate-50/30">
+                            <td className="px-8 py-4 font-semibold text-slate-700 italic">"{p.name}"</td>
+                            <td className="px-4 py-4 text-center text-slate-400 text-[11px] font-bold">
+                              {p.periodStart.slice(5)} - {p.periodEnd === globalMaxDate ? '현재' : p.periodEnd.slice(5)}
+                            </td>
+                            <td className="px-4 py-4 text-right font-black text-blue-600">{p.totalViews.toLocaleString()}회</td>
+                            <td className="px-4 py-4 text-right font-bold text-slate-900">₩{p.totalRevenue.toLocaleString()}</td>
+                            <td className="px-4 py-4 text-right font-bold text-indigo-600">{p.dailyAvgViews.toFixed(1)}회</td>
+                            <td className="px-8 py-4 text-right font-black text-emerald-600">{p.cvr.toFixed(2)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* 유입 추이 차트 */}
+              <div className="space-y-6">
+                <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600"><Eye size={16} /></div>
+                    <h4 className="text-lg font-bold text-slate-900">일별 조회수 타임라인</h4>
+                </div>
+                <div className="h-64 bg-white p-6 rounded-[32px] border border-slate-100 shadow-sm">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={selectedProduct.history}>
+                      <defs>
+                        <linearGradient id="colorProdViews" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.1}/>
+                          <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                      <XAxis dataKey="date" hide />
+                      <YAxis hide />
+                      <Tooltip contentStyle={{borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)'}} />
+                      <Area name="조회수" type="monotone" dataKey="조회수" stroke="#3b82f6" strokeWidth={4} fillOpacity={1} fill="url(#colorProdViews)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+            
+            <div className="p-8 bg-white border-t border-slate-50 flex justify-center">
+              <button onClick={() => setSelectedProduct(null)} className="px-16 py-4 bg-slate-900 text-white rounded-2xl font-bold hover:scale-105 active:scale-95 transition-all shadow-xl">닫기</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {statusMessage && (
-        <div className={`fixed bottom-8 right-8 px-6 py-4 rounded-2xl shadow-2xl text-white font-bold flex items-center gap-3 animate-in slide-in-from-bottom-5 z-[200] ${statusMessage.type === 'error' ? 'bg-rose-500' : 'bg-slate-900'}`}>
+        <div className={`fixed bottom-8 right-8 px-6 py-4 rounded-2xl shadow-2xl text-white font-bold flex items-center gap-3 animate-in slide-in-from-bottom-5 z-[200] ${statusMessage.type === 'error' ? 'bg-rose-500' : statusMessage.type === 'info' ? 'bg-indigo-500' : 'bg-slate-900'}`}>
           {statusMessage.text}
           <button onClick={() => setStatusMessage(null)}><X size={16} /></button>
         </div>
