@@ -51,14 +51,41 @@ const App = () => {
   const [globalMaxDate, setGlobalMaxDate] = useState('');
   const [user, setUser] = useState(null);
 
-  // 라이브러리 로드
+  // 1. 초기 마운트 시 로컬 스토리지에서 데이터 불러오기
   useEffect(() => {
+    const savedLocal = localStorage.getItem('sales_dashboard_local_data');
+    if (savedLocal) {
+      try {
+        const parsed = JSON.parse(savedLocal);
+        setProcessedData(parsed.processedData || []);
+        setDailyTrend(parsed.dailyTrend || []);
+        setMonthlyTrend(parsed.monthlyTrend || []);
+        setGlobalMaxDate(parsed.globalMaxDate || '');
+      } catch (e) {
+        console.error("Local load error:", e);
+      }
+    }
+
     if (window.XLSX) { setIsLibLoaded(true); return; }
     const script = document.createElement("script");
     script.src = EXCEL_LIB_URL;
     script.onload = () => setIsLibLoaded(true);
     document.head.appendChild(script);
   }, []);
+
+  // 2. 데이터가 변경될 때마다 로컬 스토리지에 자동 저장 (방어막)
+  useEffect(() => {
+    if (processedData.length > 0) {
+      const dataToSave = {
+        processedData,
+        dailyTrend,
+        monthlyTrend,
+        globalMaxDate,
+        lastUpdated: new Date().toISOString()
+      };
+      localStorage.setItem('sales_dashboard_local_data', JSON.stringify(dataToSave));
+    }
+  }, [processedData, dailyTrend, monthlyTrend, globalMaxDate]);
 
   // Firebase 인증 (RULE 3 준수)
   useEffect(() => {
@@ -71,12 +98,6 @@ const App = () => {
         }
       } catch (error) {
         console.error("Auth Error:", error);
-        if (error.code === 'auth/configuration-not-found') {
-          setStatusMessage({ 
-            type: 'error', 
-            text: 'Firebase 설정 오류: 콘솔에서 [Anonymous] 인증을 활성화해야 합니다.' 
-          });
-        }
       }
     };
     initAuth();
@@ -86,23 +107,27 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 로그인 상태 확인 후 데이터 자동 불러오기 (RULE 1 & 3 준수)
+  // 로그인 상태 확인 후 클라우드 데이터 불러오기 (RULE 1 & 3 준수)
   useEffect(() => {
     if (!user) return;
     
     const loadFromCloud = async () => {
       try {
-        // RULE 1: /artifacts/{appId}/users/{userId}/{collectionName}
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'reports', 'latest');
         const docSnap = await getDoc(docRef);
         
         if (docSnap.exists()) {
           const savedData = docSnap.data();
-          setProcessedData(JSON.parse(savedData.processedData || '[]'));
-          setDailyTrend(JSON.parse(savedData.dailyTrend || '[]'));
-          setMonthlyTrend(JSON.parse(savedData.monthlyTrend || '[]'));
-          setGlobalMaxDate(savedData.globalMaxDate || '');
-          setStatusMessage({ type: 'success', text: '클라우드 데이터를 성공적으로 불러왔습니다.' });
+          const cloudData = JSON.parse(savedData.processedData || '[]');
+          
+          // 클라우드 데이터가 로컬보다 최신이거나 로컬이 비어있을 때만 업데이트
+          if (cloudData.length > 0 && processedData.length === 0) {
+            setProcessedData(cloudData);
+            setDailyTrend(JSON.parse(savedData.dailyTrend || '[]'));
+            setMonthlyTrend(JSON.parse(savedData.monthlyTrend || '[]'));
+            setGlobalMaxDate(savedData.globalMaxDate || '');
+            setStatusMessage({ type: 'success', text: '클라우드 데이터를 불러왔습니다.' });
+          }
         }
       } catch (e) {
         console.error("Data loading failed:", e);
@@ -132,7 +157,7 @@ const App = () => {
       setStatusMessage({ type: 'success', text: '클라우드에 안전하게 저장되었습니다.' });
     } catch (err) {
       console.error(err);
-      setStatusMessage({ type: 'error', text: '저장 실패: 데이터 용량이 너무 크거나 권한이 없습니다.' });
+      setStatusMessage({ type: 'error', text: '저장 실패: Firebase 설정을 확인해주세요.' });
     } finally {
       setIsProcessing(false);
     }
@@ -225,7 +250,7 @@ const App = () => {
       setProcessedData(finalProducts);
       setDailyTrend(Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)));
       setMonthlyTrend(Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month)));
-      setStatusMessage({ type: 'success', text: `분석 완료! 클라우드 저장 버튼을 눌러 데이터를 보관하세요.` });
+      setStatusMessage({ type: 'success', text: `데이터 분석 완료! 브라우저에 자동 저장되었습니다.` });
     } catch (err) {
       setStatusMessage({ type: 'error', text: '파일 처리 오류' });
     } finally {
@@ -245,6 +270,17 @@ const App = () => {
     return filtered.sort((a, b) => (b[sortConfig.key] || 0) - (a[sortConfig.key] || 0));
   }, [processedData, searchTerm, showOnlyNameChanged, sortConfig]);
 
+  const clearData = () => {
+    if (confirm("모든 데이터를 삭제하시겠습니까? 로컬 저장소에서도 삭제됩니다.")) {
+      setProcessedData([]);
+      setDailyTrend([]);
+      setMonthlyTrend([]);
+      setGlobalMaxDate('');
+      localStorage.removeItem('sales_dashboard_local_data');
+      setStatusMessage({ type: 'success', text: '데이터가 초기화되었습니다.' });
+    }
+  };
+
   return (
     <div className="min-h-screen bg-white text-slate-800 font-sans">
       <aside className={`fixed left-0 top-0 h-full bg-white border-r border-slate-100 z-30 flex flex-col transition-all ${isSidebarCollapsed ? 'w-20' : 'w-64'}`}>
@@ -260,22 +296,30 @@ const App = () => {
             <ShoppingCart size={20} /> {!isSidebarCollapsed && <span>상품분석</span>}
           </button>
         </nav>
-        <div className="p-4">
+        <div className="p-4 space-y-2">
           <div className="relative bg-slate-50 p-4 rounded-2xl border border-slate-100 flex flex-col items-center gap-2">
             <input type="file" multiple accept=".xlsx" onChange={(e) => processFiles(Array.from(e.target.files))} className="absolute inset-0 opacity-0 cursor-pointer" />
             <Upload size={20} className="text-indigo-600" />
-            {!isSidebarCollapsed && <span className="text-xs font-bold">엑셀 업로드</span>}
+            {!isSidebarCollapsed && <span className="text-xs font-bold">엑셀 추가 업로드</span>}
           </div>
+          {processedData.length > 0 && !isSidebarCollapsed && (
+            <button onClick={clearData} className="w-full flex items-center justify-center gap-2 p-3 text-rose-500 hover:bg-rose-50 rounded-xl text-xs font-bold transition-all">
+              데이터 초기화
+            </button>
+          )}
         </div>
       </aside>
 
       <main className={`transition-all ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between px-8 border-b border-slate-50">
-          <h2 className="text-xl font-bold">{activeTab === 'dashboard' ? '종합 리포트' : '상품 상세 리스트'}</h2>
+          <div className="flex items-center gap-4">
+             <h2 className="text-xl font-bold">{activeTab === 'dashboard' ? '종합 리포트' : '상품 상세 리스트'}</h2>
+             <span className="text-[10px] bg-emerald-50 text-emerald-600 px-2 py-1 rounded-full font-bold">로컬 자동저장 활성</span>
+          </div>
           <div className="flex gap-2">
             {processedData.length > 0 && (
               <button onClick={saveToCloud} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all">
-                <Cloud size={16} /> 클라우드 저장
+                <Cloud size={16} /> 클라우드 영구보관
               </button>
             )}
           </div>
@@ -285,8 +329,7 @@ const App = () => {
           {processedData.length === 0 ? (
             <div className="h-[60vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-[40px]">
               <FileSpreadsheet size={64} className="mb-4 opacity-20" />
-              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드하거나 <br/> 저장된 데이터를 기다려주세요.</p>
-              {!user && <p className="text-xs mt-4 text-indigo-400">Firebase 인증 대기 중...</p>}
+              <p className="font-medium text-lg text-center px-6">엑셀 파일을 업로드해 주세요. <br/> 한 번 분석된 데이터는 자동으로 저장됩니다.</p>
             </div>
           ) : (
             <>
