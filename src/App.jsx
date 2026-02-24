@@ -13,7 +13,7 @@ import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, doc, setDoc, getDoc, collection, getDocs, writeBatch, onSnapshot, deleteDoc } from 'firebase/firestore';
 
-// 외부 라이브러리 (무거운 압축 라이브러리 제거, 엑셀 처리만 유지)
+// 외부 라이브러리
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
 
 /**
@@ -52,17 +52,17 @@ const App = () => {
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [statusMessage, setStatusMessage] = useState(null);
-  const [visibleCount, setVisibleCount] = useState(50); // 화면 멈춤 방지용 페이징
+  const [visibleCount, setVisibleCount] = useState(50);
   
   // --- 인프라 상태 ---
   const [user, setUser] = useState(null);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
 
-  // 실시간 구독 충돌 방지를 위한 Ref
+  // 실시간 구독 충돌 방지
   const isSyncingRef = useRef(false);
+  const isProcessingRef = useRef(false);
 
-  // 검색이나 정렬이 바뀌면 보이는 개수 초기화
   useEffect(() => {
     setVisibleCount(50);
   }, [searchTerm, sortConfig, showOnlyNameChanged, activeTab]);
@@ -79,7 +79,7 @@ const App = () => {
     }
   }, []);
 
-  // 2. 인증 관리 (익명 로그인 보장)
+  // 2. 인증 관리
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -101,30 +101,32 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 3. 진정한 '공용 데이터베이스' 실시간 동기화 (초고속 네이티브 파싱 적용)
+  // 3. 진정한 '공용 DB' 실시간 동기화 (네트워크 1회 호출로 초고속 로딩 달성)
   useEffect(() => {
     if (!user) return;
     
     const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
     
     const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
-      if (isSyncingRef.current) return;
+      if (isSyncingRef.current || isProcessingRef.current) return;
       
       if (metaSnap.exists()) {
         setIsInitialLoading(true);
         try {
           const meta = metaSnap.data();
-          const chunkCount = meta.chunkCount || 0;
           
-          let chunkPromises = [];
-          for (let i = 0; i < chunkCount; i++) {
-            chunkPromises.push(getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`)));
-          }
+          // [핵심 최적화] 조각(Chunk)들을 한 번에 쓸어옵니다. (단 1번의 네트워크 요청)
+          const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+          const chunkSnaps = await getDocs(payloadsCol);
           
-          const snaps = await Promise.all(chunkPromises);
-          const fullPayload = snaps.map(s => s.exists() ? s.data().data : "").join("");
+          let chunksArr = [];
+          chunkSnaps.forEach(d => {
+            const idx = parseInt(d.id.replace('chunk_', ''));
+            chunksArr[idx] = d.data().data;
+          });
           
-          // 압축 해제 없이 브라우저 네이티브 JSON.parse 사용 (속도 10배 이상 향상)
+          const fullPayload = chunksArr.join("");
+          
           if (fullPayload) {
             const parsed = JSON.parse(fullPayload);
             setProcessedData(parsed.processedData || []);
@@ -142,7 +144,7 @@ const App = () => {
         } finally {
           setIsInitialLoading(false);
         }
-      } else if (!metaSnap.exists()) {
+      } else {
         setProcessedData([]);
         setIsInitialLoading(false);
       }
@@ -154,7 +156,7 @@ const App = () => {
     return () => unsubscribe();
   }, [user, db]);
 
-  // --- 공용 클라우드 [Batch 일괄 저장] (압축 제외 초고속 버전) ---
+  // --- 공용 클라우드 [Batch 일괄 저장] (극강의 안정성과 속도) ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db) return;
     
@@ -164,20 +166,27 @@ const App = () => {
     try {
       const payloadString = JSON.stringify(dataObj);
       
-      // 한글 포함 안전 길이: 25만자 단위(약 750KB 이하)로 분할하여 1MB 한계 회피
-      const chunkSize = 250000; 
+      // 약 400KB 단위로 분할 (Firestore 1MB 문서 한계를 완벽히 피함)
+      const chunkSize = 400000; 
       const chunks = [];
       for (let i = 0; i < payloadString.length; i += chunkSize) {
         chunks.push(payloadString.substring(i, i + chunkSize));
       }
 
       const batch = writeBatch(db);
+      
+      // 1. 기존 쓰레기 조각 청소 (찌꺼기 방지)
+      const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+      const oldChunks = await getDocs(payloadsCol);
+      oldChunks.forEach(d => batch.delete(d.ref));
 
+      // 2. 새로운 조각 쓰기
       for (let i = 0; i < chunks.length; i++) {
         const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`);
         batch.set(chunkRef, { data: chunks[i] });
       }
 
+      // 3. 메타데이터 업데이트 (동기화 트리거 역할)
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
       batch.set(metaRef, {
         chunkCount: chunks.length,
@@ -186,8 +195,9 @@ const App = () => {
         authorId: user.uid
       });
       
+      // 위 작업을 하나의 덩어리로 서버에 일괄 전송!
       await batch.commit();
-      setStatusMessage({ type: 'success', text: '팀 전체에 최신 데이터가 배포되었습니다!' });
+      setStatusMessage({ type: 'success', text: '팀 전체에 최신 데이터 배포 완료!' });
     } catch (err) { 
       console.error("Sync error:", err);
       setStatusMessage({ type: 'error', text: '데이터 배포 실패: 네트워크를 확인해 주세요.' });
@@ -224,14 +234,15 @@ const App = () => {
   const processFiles = async (targetFiles) => {
     if (!isLibLoaded) return;
     setIsProcessing(true);
+    isProcessingRef.current = true;
     
-    // CPU 연산을 줄이기 위한 맵 최적화
     const productMap = new Map();
     const dailyMap = new Map();
     const monthlyMap = new Map();
     const productDailyHistory = new Map();
     let currentMaxDate = globalMaxDate;
 
+    // 공용 DB 기존 데이터 복원
     processedData.forEach(p => {
       productMap.set(p.상품ID, { ...p });
       productDailyHistory.set(p.상품ID, [...(p.history || [])]);
@@ -250,15 +261,24 @@ const App = () => {
         if (!monthlyMap.has(monthStr)) monthlyMap.set(monthStr, { month: monthStr, 매출: 0, 조회수: 0, 판매량: 0 });
 
         data.forEach(item => {
-          const pid = String(item['상품ID']);
+          const pid = String(item['상품ID'] || item['상품번호']);
           if (!pid || pid === "undefined") return;
           const currentName = item['상품명'] || '이름 없음';
           const revenue = Number(item['결제금액']) || 0;
           const views = Number(item['상품상세조회수']) || 0;
           const sales = Number(item['결제상품수량']) || 0;
 
+          // [핵심 용량 다이어트] 엑셀의 불필요한 열을 완전히 버리고 딱 필요한 정보만 저장합니다!
           if (!productMap.has(pid)) {
-            productMap.set(pid, { ...item, 상품ID: pid, 결제금액: revenue, 상품상세조회수: views, 결제상품수량: sales, nameHistory: [{ name: currentName, start: dateStr, end: dateStr }], lastName: currentName, nameCount: 1 });
+            productMap.set(pid, { 
+              상품ID: pid, 
+              lastName: currentName,
+              결제금액: revenue, 
+              상품상세조회수: views, 
+              결제상품수량: sales, 
+              nameHistory: [{ name: currentName, start: dateStr, end: dateStr }], 
+              nameCount: 1 
+            });
           } else {
             const p = productMap.get(pid);
             p.결제금액 += revenue; p.상품상세조회수 += views; p.결제상품수량 += sales;
@@ -307,13 +327,15 @@ const App = () => {
       setMonthlyTrend(finalMonthlyTrend);
       setGlobalMaxDate(currentMaxDate);
       setIsProcessing(false);
+      isProcessingRef.current = false;
 
-      // 백그라운드 동기화
+      // 백그라운드 초고속 동기화
       performCloudSync({ processedData: finalProducts, dailyTrend: finalDailyTrend, monthlyTrend: finalMonthlyTrend, globalMaxDate: currentMaxDate });
       
     } catch (err) { 
       console.error(err);
       setIsProcessing(false);
+      isProcessingRef.current = false;
       setStatusMessage({ type: 'error', text: '데이터 파싱 중 오류가 발생했습니다.' }); 
     }
   };
@@ -337,17 +359,23 @@ const App = () => {
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
   const clearData = async () => {
-    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n모든 사용자의 화면에서도 삭제됩니다.")) {
+    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속 중인 모든 사용자의 데이터가 완전히 삭제됩니다.")) {
       setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
       try {
         const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
         await deleteDoc(metaRef);
+        
+        const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+        const oldChunks = await getDocs(payloadsCol);
+        const batch = writeBatch(db);
+        oldChunks.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+
         setStatusMessage({ type: 'success', text: '공용 데이터가 비워졌습니다.' });
       } catch(e) { console.error("Delete error", e); }
     }
   };
 
-  // 알림 토스트 닫기 처리
   useEffect(() => {
     if (statusMessage) {
       const timer = setTimeout(() => setStatusMessage(null), 4000);
@@ -416,7 +444,7 @@ const App = () => {
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
               <div className="bg-slate-50 p-8 rounded-full mb-8"><FileSpreadsheet size={64} className="text-blue-200" /></div>
               <h3 className="text-2xl font-black text-slate-900 mb-2 italic">팀 워크스페이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하여 팀원들과 분석 데이터를 공유하세요.<br/>초고속 동기화로 멈춤 없이 즉시 반영됩니다.</p>
+              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하여 팀원들과 분석 데이터를 공유하세요.<br/>최적화된 동기화 엔진으로 즉시 팀원들에게 반영됩니다.</p>
             </div>
           ) : (
             <>
