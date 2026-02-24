@@ -38,7 +38,7 @@ const App = () => {
   const [isWakingUp, setIsWakingUp] = useState(false);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
 
-  // 1. 엑셀 라이브러리 동적 로드 (로컬 처리 및 서버 백업용)
+  // 1. 엑셀 라이브러리 동적 로드
   useEffect(() => {
     if (!document.querySelector(`script[src="${EXCEL_LIB_URL}"]`)) {
       const script = document.createElement("script");
@@ -50,7 +50,6 @@ const App = () => {
     }
   }, []);
 
-  // 검색/정렬 변경 시 목록 초기화
   useEffect(() => {
     setVisibleCount(50);
   }, [searchTerm, sortConfig, showOnlyNameChanged, activeTab]);
@@ -78,7 +77,6 @@ const App = () => {
     } catch (error) {
       console.error("Fetch error:", error);
       setHasConnectionError(true);
-      // 서버 연결 실패 시 안내 토스트 제거 (UI에서 별도 표시)
     } finally {
       clearTimeout(wakingUpTimer);
       setIsFetching(false);
@@ -89,9 +87,6 @@ const App = () => {
     fetchDashboardData();
   }, []);
 
-  /**
-   * 로컬에서 파일명 날짜 추출
-   */
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -101,9 +96,6 @@ const App = () => {
     }).sort().pop();
   };
 
-  /**
-   * 로컬 엑셀 파싱 및 집계 (서버 연결 실패 시 캔버스에서라도 보여주기 위한 백업 로직)
-   */
   const processLocally = async (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -119,9 +111,6 @@ const App = () => {
     });
   };
 
-  /**
-   * 파일 업로드 및 분석 로직 (서버 전송 시도 + 로컬 업데이트 동시 실행)
-   */
   const handleFileUpload = async (event) => {
     const files = Array.from(event.target.files);
     if (files.length === 0) return;
@@ -130,29 +119,21 @@ const App = () => {
     setStatusMessage({ type: 'info', text: '데이터를 분석하고 서버로 전송합니다...' });
 
     try {
-      // 1. [로컬 처리] 캔버스에서도 즉시 결과를 볼 수 있게 합니다.
       const productMap = new Map(processedData.map(p => [p.상품ID, { ...p, history: [...(p.history || [])] }]));
       const dailyMap = new Map(dailyTrend.map(d => [d.date, { ...d }]));
       const monthlyMap = new Map(monthlyTrend.map(m => [m.month, { ...m }]));
       let currentMaxDate = globalMaxDate;
 
       for (const file of files) {
-        // 서버 전송 시도
         const formData = new FormData();
         formData.append('excelFile', file);
 
-        let serverSuccess = false;
         try {
-          const response = await fetch(`${SERVER_URL}/api/upload`, {
-            method: 'POST',
-            body: formData,
-          });
-          if (response.ok) serverSuccess = true;
+          await fetch(`${SERVER_URL}/api/upload`, { method: 'POST', body: formData });
         } catch (e) {
-          console.warn("서버 전송 실패, 로컬 모드로 진행합니다.");
+          console.warn("서버 전송 실패, 로컬 업데이트만 진행합니다.");
         }
 
-        // 로컬 파싱 (캔버스 미리보기용)
         const rawData = await processLocally(file);
         const dateStr = extractDate(file.name);
         const monthStr = dateStr !== '알 수 없는 날짜' ? dateStr.substring(0, 7) : '알 수 없는 월';
@@ -177,9 +158,13 @@ const App = () => {
           } else {
             const p = productMap.get(pid);
             p.결제금액 += revenue; p.상품상세조회수 += views; p.결제상품수량 += sales;
-            if (!p.nameHistory.find(nh => nh.name === name)) {
+            const existingName = p.nameHistory.find(nh => nh.name === name);
+            if (!existingName) {
               p.nameHistory.push({ name: name, start: dateStr, end: dateStr });
               p.nameCount = p.nameHistory.length; p.lastName = name;
+            } else {
+              if (dateStr < existingName.start) existingName.start = dateStr;
+              if (dateStr > existingName.end) existingName.end = dateStr;
             }
           }
 
@@ -190,7 +175,6 @@ const App = () => {
         });
       }
 
-      // 최종 상태 업데이트
       const finalDaily = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
       const finalMonthly = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
       const finalProducts = Array.from(productMap.values()).map(p => {
@@ -200,13 +184,15 @@ const App = () => {
           const tRev = nameData.reduce((s, h) => s + h.매출, 0);
           const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
           const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
+          const days = nameData.length || 1;
           return { 
             name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews,
-            dailyAvgRevenue: tRev / nameData.length || 0,
+            dailyAvgRevenue: tRev / days,
+            dailyAvgViews: tViews / days,
             cvr: tViews > 0 ? (tSales / tViews) * 100 : 0,
             periodStart: nh.start, periodEnd: nh.end
           };
-        });
+        }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
         return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history: hist, performanceByName: performance };
       });
 
@@ -215,7 +201,7 @@ const App = () => {
       setMonthlyTrend(finalMonthly);
       setGlobalMaxDate(currentMaxDate);
 
-      setStatusMessage({ type: 'success', text: '업로드가 완료되었습니다. (서버 연결 실패 시 로컬에 임시 표시됩니다)' });
+      setStatusMessage({ type: 'success', text: '업로드가 완료되었습니다.' });
 
     } catch (error) {
       console.error("Process error:", error);
@@ -226,7 +212,6 @@ const App = () => {
     }
   };
 
-  // 통계 요약 연산
   const summary = useMemo(() => {
     const totalRev = processedData.reduce((acc, curr) => acc + (Number(curr.결제금액) || 0), 0);
     const totalSales = processedData.reduce((acc, curr) => acc + (Number(curr.결제상품수량) || 0), 0);
@@ -238,7 +223,6 @@ const App = () => {
     };
   }, [processedData, dailyTrend]);
 
-  // 목록 필터링 및 정렬
   const sortedData = useMemo(() => {
     let filtered = processedData.filter(p => 
       (String(p.lastName || '').toLowerCase().includes(searchTerm.toLowerCase()) || String(p.상품ID || '').includes(searchTerm)) && 
@@ -259,9 +243,9 @@ const App = () => {
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans">
       <aside className={`fixed left-0 top-0 h-full bg-white border-r border-slate-200 z-30 flex flex-col transition-all duration-300 ${isSidebarCollapsed ? 'w-20' : 'w-64'}`}>
-        <div className="p-6 flex items-center gap-3 border-b border-slate-50">
+        <div className="p-6 flex items-center gap-3 border-b border-slate-50 text-left">
           <div className="bg-emerald-600 p-2 rounded-xl text-white shadow-xl shrink-0"><Server size={20} /></div>
-          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900 text-left">판매분석 <span className="text-emerald-600 font-bold text-sm ml-1 uppercase italic text-left">PRO</span></h1>}
+          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900 text-left">판매분석 <span className="text-emerald-600 font-bold text-sm ml-1 uppercase italic">PRO</span></h1>}
         </div>
         
         <nav className="flex-1 px-4 py-6 space-y-2">
@@ -273,8 +257,8 @@ const App = () => {
           </button>
         </nav>
 
-        <div className="p-4 space-y-3 border-t border-slate-50">
-          <div className="relative bg-slate-50 p-5 rounded-[24px] border border-slate-100 flex flex-col items-center gap-3 hover:bg-emerald-50 transition-all cursor-pointer group shadow-sm overflow-hidden">
+        <div className="p-4 space-y-3 border-t border-slate-50 text-left">
+          <div className="relative bg-slate-50 p-5 rounded-[24px] border border-slate-100 flex flex-col items-center gap-3 hover:bg-emerald-50 transition-all cursor-pointer group shadow-sm overflow-hidden text-left">
             <input type="file" multiple accept=".xlsx" onChange={handleFileUpload} className="absolute inset-0 opacity-0 cursor-pointer z-10" title="파일 선택" disabled={isUploading} />
             <div className={`p-2.5 rounded-xl shadow-md transition-transform ${isUploading ? 'bg-slate-200 animate-pulse' : 'bg-white group-hover:scale-110'}`}>
               <Upload size={22} className={isUploading ? 'text-slate-400' : 'text-emerald-600'} />
@@ -287,7 +271,7 @@ const App = () => {
                <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${hasConnectionError ? 'bg-rose-100 text-rose-600' : 'bg-emerald-100 text-emerald-600'}`}>
                  {hasConnectionError ? <AlertCircle size={14} /> : <Database size={14} />}
                </div>
-               <div className="min-w-0">
+               <div className="min-w-0 text-left">
                   <p className={`text-[9px] font-black uppercase tracking-widest leading-none mb-1 ${hasConnectionError ? 'text-rose-600' : 'text-emerald-600'}`}>
                     {hasConnectionError ? 'OFFLINE' : 'LIVE'}
                   </p>
@@ -301,35 +285,35 @@ const App = () => {
       </aside>
 
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
-        <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
+        <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100 text-left">
           <div className="flex items-center gap-4 text-left">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '서버 리포트' : '상품 성과 리스트'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none text-left">{activeTab === 'dashboard' ? '서버 통합 리포트' : '상품별 상세 분석'}</h2>
              <div className="flex items-center gap-2">
                <div className={`h-2 w-2 rounded-full ${isFetching || isUploading ? 'bg-amber-400 animate-pulse' : hasConnectionError ? 'bg-rose-500' : 'bg-emerald-500'}`}></div>
-               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Real-time PRO</span>
+               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest text-left">Real-time PRO</span>
              </div>
           </div>
-          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90"><Menu size={22} /></button>
+          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90 text-left"><Menu size={22} /></button>
         </header>
 
-        <div className="p-10 max-w-[1500px] mx-auto space-y-10">
+        <div className="p-10 max-w-[1500px] mx-auto space-y-10 text-left">
           {isFetching && processedData.length === 0 ? (
-            <div className="h-[60vh] flex flex-col items-center justify-center">
+            <div className="h-[60vh] flex flex-col items-center justify-center text-center">
               <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent rounded-full animate-spin mb-4"></div>
               <p className="font-black text-slate-400 tracking-widest uppercase text-xs mt-4">
                 {isWakingUp ? '서버가 깨어나는 중입니다 (최대 1분)...' : '데이터를 불러오고 있습니다...'}
               </p>
             </div>
           ) : (processedData.length === 0 && !hasConnectionError) ? (
-            <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
-              <div className="bg-slate-50 p-8 rounded-full mb-8 text-indigo-200"><Database size={64} /></div>
-              <h3 className="text-2xl font-black text-slate-900 mb-2 italic text-center">데이터베이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium">엑셀 파일을 업로드하면 분석이 시작됩니다.</p>
+            <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl text-center">
+              <div className="bg-slate-50 p-8 rounded-full mb-8 text-indigo-200 text-center"><Database size={64} /></div>
+              <h3 className="text-2xl font-black text-slate-900 mb-2 italic text-center text-left">데이터베이스가 비어있습니다.</h3>
+              <p className="text-slate-400 font-medium text-center text-left">엑셀 파일을 업로드하면 분석이 시작됩니다.</p>
             </div>
           ) : (
             <>
-              {/* 요약 대시보드 */}
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+              {/* 요약 카드 */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 text-left">
                 {[
                   { label: '누적 매출액', val: `₩${summary.revenue.toLocaleString()}`, icon: TrendingUp },
                   { label: '누적 유입수', val: `${summary.views.toLocaleString()}회`, icon: Eye },
@@ -348,11 +332,11 @@ const App = () => {
               </div>
 
               {activeTab === 'dashboard' ? (
-                <div className="space-y-10 animate-in fade-in slide-in-from-bottom-6 duration-700">
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+                <div className="space-y-10 animate-in fade-in slide-in-from-bottom-6 duration-700 text-left">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 text-left">
                     <div className="bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
                       <h3 className="font-black text-lg mb-8 flex items-center gap-3 text-left"><div className="w-1.5 h-6 bg-emerald-600 rounded-full text-left"></div> 월간 매출 성장</h3>
-                      <div className="h-72">
+                      <div className="h-72 text-left">
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart data={monthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
@@ -367,7 +351,7 @@ const App = () => {
                     </div>
                     <div className="bg-white p-10 rounded-[48px] border border-emerald-100 shadow-xl shadow-emerald-50/50 text-left">
                       <h3 className="font-black text-lg mb-8 flex items-center gap-3 text-emerald-700 text-left"><div className="w-1.5 h-6 bg-emerald-500 rounded-full text-left"></div> 월간 유입수 변화</h3>
-                      <div className="h-72">
+                      <div className="h-72 text-left">
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart data={monthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
@@ -378,6 +362,20 @@ const App = () => {
                           </BarChart>
                         </ResponsiveContainer>
                       </div>
+                    </div>
+                  </div>
+
+                  {/* 일별 조회수 그래프 */}
+                  <div className="bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                    <h3 className="font-black text-lg flex items-center gap-3 text-emerald-500 mb-10 text-left"><div className="w-1.5 h-6 bg-emerald-400 rounded-full text-left"></div> 일별 유입량 변화 추이</h3>
+                    <div className="h-96 text-left">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={dailyTrend}>
+                          <defs><linearGradient id="colorViewsMain" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.2}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 25px 50px -12px rgb(0 0 0 / 0.25)'}} />
+                          <Area name="일일 조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorViewsMain)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
                     </div>
                   </div>
                 </div>
@@ -400,27 +398,38 @@ const App = () => {
                           <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상품상세조회수')}>조회수</th>
                           <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제상품수량')}>주문량</th>
                           <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제금액')}>매출액</th>
-                          <th className="px-10 py-6 text-center text-left">상세</th>
+                          <th className="px-10 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상세조회대비결제율')}>전환율</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50 text-left">
                         {sortedData.slice(0, visibleCount).map((item, idx) => (
                           <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer text-left" onClick={() => setSelectedProduct(item)}>
-                            <td className="px-10 py-8 text-left">
+                            <td className="px-10 py-8 min-w-[350px] text-left">
                               <div className="font-black text-slate-900 group-hover:text-emerald-600 transition-colors text-left leading-relaxed">
-                                {item.lastName} {Number(item.nameCount) > 1 && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded font-black mt-1 uppercase text-left">MODIFIED</span>}
+                                {String(item.lastName || '이름 없음')} {Number(item.nameCount) > 1 && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded font-black mt-1 uppercase text-left">MODIFIED</span>}
                               </div>
-                              <div className="text-[10px] text-slate-400 mt-2 font-black tracking-widest text-left">ID: {item.상품ID}</div>
+                              <div className="text-[10px] text-slate-400 mt-2 font-black tracking-widest uppercase text-left">ID: {String(item.상품ID || '')}</div>
                             </td>
-                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(item.상품상세조회수 || 0).toLocaleString()}</td>
-                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(item.결제상품수량 || 0).toLocaleString()}</td>
-                            <td className="px-6 py-8 font-black text-slate-900 italic text-left">₩{(item.결제금액 || 0).toLocaleString()}</td>
-                            <td className="px-10 py-8 text-center text-left"><div className="w-12 h-12 rounded-2xl bg-white border border-slate-100 flex items-center justify-center text-slate-300 mx-auto text-left"><ChevronRight size={18} /></div></td>
+                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(Number(item.상품상세조회수) || 0).toLocaleString()}</td>
+                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(Number(item.결제상품수량) || 0).toLocaleString()}</td>
+                            <td className="px-6 py-8 font-black text-slate-900 italic text-left">₩{(Number(item.결제금액) || 0).toLocaleString()}</td>
+                            <td className="px-10 py-8 text-left">
+                              <span className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-lg text-xs font-black text-left">
+                                {(Number(item.상세조회대비결제율) * 100).toFixed(2)}%
+                              </span>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
+                  {visibleCount < sortedData.length && (
+                    <div className="p-6 bg-slate-50/30 flex justify-center border-t border-slate-50 text-left">
+                      <button onClick={() => setVisibleCount(v => v + 50)} className="px-8 py-3 bg-white border border-slate-200 text-slate-600 rounded-full font-bold text-sm hover:bg-slate-50 hover:text-emerald-600 transition-colors flex items-center gap-2 shadow-sm text-left">
+                        데이터 더 보기 <ChevronDown size={16} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </>
@@ -428,48 +437,89 @@ const App = () => {
         </div>
       </main>
 
-      {/* 상품 상세 모달 */}
+      {/* 상품 상세 분석 모달 */}
       {selectedProduct && (
         <div className="fixed inset-0 bg-slate-900/30 backdrop-blur-2xl z-50 flex items-center justify-center p-8 animate-in fade-in duration-300 text-left">
-          <div className="bg-white w-full max-w-7xl max-h-[94vh] rounded-[64px] shadow-2xl border-4 border-white flex flex-col overflow-hidden text-left">
+          <div className="bg-white w-full max-w-7xl max-h-[94vh] rounded-[64px] shadow-2xl border-4 border-white flex flex-col overflow-hidden animate-in zoom-in-95 duration-500 text-left">
             <div className="px-12 py-12 flex items-center justify-between border-b border-slate-50 text-left">
               <div className="flex items-center gap-10 text-left">
-                <div className="bg-emerald-600 p-6 rounded-[32px] text-white shadow-2xl text-left"><Eye size={36} /></div>
-                <div className="text-left">
-                  <h3 className="text-3xl font-black text-slate-900 leading-tight text-left italic">{selectedProduct.lastName}</h3>
-                  <p className="text-xs text-slate-400 font-black mt-2 tracking-[0.3em] uppercase opacity-60 text-left">PID: {selectedProduct.상품ID}</p>
+                <div className="bg-emerald-600 p-6 rounded-[32px] text-white shadow-2xl shrink-0 text-left"><Eye size={36} /></div>
+                <div className="max-w-[800px] text-left">
+                  <h3 className="text-3xl font-black text-slate-900 leading-tight whitespace-normal break-words tracking-tighter italic text-left">{String(selectedProduct.lastName || '')}</h3>
+                  <p className="text-xs text-slate-400 font-black mt-2 tracking-[0.3em] uppercase opacity-60 italic text-left">PRODUCT IDENTITY: {String(selectedProduct.상품ID || '')}</p>
                 </div>
               </div>
-              <button onClick={() => setSelectedProduct(null)} className="w-16 h-16 bg-slate-50 hover:bg-white hover:shadow-2xl rounded-full flex items-center justify-center text-left"><X size={28} /></button>
+              <button onClick={() => setSelectedProduct(null)} className="w-16 h-16 bg-slate-50 hover:bg-white hover:shadow-2xl rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100 hover:rotate-90 duration-500 text-left"><X size={28} /></button>
             </div>
             <div className="flex-1 overflow-y-auto px-12 py-12 space-y-16 text-left">
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 text-left">
-                {[{ label: '누적 유입수', val: `${(selectedProduct.상품상세조회수 || 0).toLocaleString()}회` }, { label: '누적 매출액', val: `₩${(selectedProduct.결제금액 || 0).toLocaleString()}` }, { label: '누적 주문량', val: `${(selectedProduct.결제상품수량 || 0).toLocaleString()}건` }, { label: '평균 전환율', val: `${(Number(selectedProduct.상세조회대비결제율) * 100).toFixed(2)}%` }].map((stat, i) => (
-                  <div key={i} className="p-8 rounded-[40px] border shadow-sm bg-slate-50/30 border-slate-50 text-left">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-2 text-left">{stat.label}</p>
+                {[
+                  { label: '누적 유입수', val: `${(Number(selectedProduct.상품상세조회수) || 0).toLocaleString()}회` },
+                  { label: '누적 매출액', val: `₩${(Number(selectedProduct.결제금액) || 0).toLocaleString()}` },
+                  { label: '누적 주문량', val: `${(Number(selectedProduct.결제상품수량) || 0).toLocaleString()}건` },
+                  { label: '평균 전환율', val: `${(Number(selectedProduct.상세조회대비결제율) * 100).toFixed(2)}%` }
+                ].map((stat, i) => (
+                  <div key={i} className={`p-8 rounded-[40px] border shadow-sm bg-slate-50/30 border-slate-50 text-left`}>
+                    <p className={`text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-2 text-left`}>{stat.label}</p>
                     <p className="text-3xl font-black text-slate-900 tracking-tighter text-left">{stat.val}</p>
                   </div>
                 ))}
               </div>
-              {Array.isArray(selectedProduct.performanceByName) && (
+              
+              {/* 명칭 변경 이력 상세 지표 분석 (일평균 유입수 포함) */}
+              {Array.isArray(selectedProduct.performanceByName) && selectedProduct.performanceByName.length > 0 && (
                 <div className="space-y-8 text-left">
-                  <div className="flex items-center gap-4 text-left"><History size={20} className="text-emerald-600" /><h4 className="text-xl font-black text-slate-900 tracking-tight text-left italic">명칭 변경 이력 분석</h4></div>
+                  <div className="flex items-center gap-4 text-left">
+                    <div className="w-10 h-10 rounded-2xl bg-emerald-50 flex items-center justify-center text-emerald-600 shadow-sm text-left"><History size={20} /></div>
+                    <h4 className="text-xl font-black text-slate-900 tracking-tight italic text-left">명칭 변경 이력 및 성과 비교</h4>
+                  </div>
                   <div className="bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-2xl text-left">
                     <table className="w-full text-left text-sm text-left">
                       <thead>
-                        <tr className="bg-slate-50/60 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left"><th className="px-10 py-6 text-left">상품명</th><th className="px-4 py-6 text-left">사용 기간</th><th className="px-4 py-6 text-right text-left">매출액</th><th className="px-10 py-6 text-right text-left">전환율</th></tr>
+                        <tr className="bg-slate-50/60 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">
+                          <th className="px-10 py-6 text-left">사용된 상품명</th>
+                          <th className="px-4 py-6 text-center text-left">기간</th>
+                          <th className="px-4 py-6 text-right text-left">유입수</th>
+                          <th className="px-4 py-6 text-right text-sky-600 text-left">일평균 유입</th>
+                          <th className="px-4 py-6 text-right text-left">매출액</th>
+                          <th className="px-4 py-6 text-right text-emerald-600 text-left">일평균 매출</th>
+                          <th className="px-10 py-6 text-right text-left">전환율</th>
+                        </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-50 text-left">
+                      <tbody className="divide-y divide-slate-50">
                         {selectedProduct.performanceByName.map((p, i) => (
-                          <tr key={i} className="hover:bg-slate-50/30 transition-colors font-black text-left"><td className="px-10 py-6 font-bold text-slate-800 text-left">{p.name}</td><td className="px-4 py-6 text-slate-400 text-[11px] text-left">{p.periodStart} - {p.periodEnd}</td><td className="px-4 py-6 text-right text-left">₩{(p.totalRevenue || 0).toLocaleString()}</td><td className="px-10 py-6 text-right text-left">{(p.cvr || 0).toFixed(2)}%</td></tr>
+                          <tr key={i} className="hover:bg-slate-50/30 transition-colors font-black text-left">
+                            <td className="px-10 py-6 font-bold text-slate-800 italic text-left">{String(p.name || '')}</td>
+                            <td className="px-4 py-6 text-center text-slate-400 text-[11px] text-left">
+                              {String(p.periodStart || '').replace(/-/g,'.')} - {String(p.periodEnd || '').replace(/-/g,'.')}
+                            </td>
+                            <td className="px-4 py-6 text-right text-left">{(Number(p.totalViews) || 0).toLocaleString()}회</td>
+                            <td className="px-4 py-6 text-right text-sky-600 text-left">{(Number(p.dailyAvgViews) || 0).toFixed(1)}회</td>
+                            <td className="px-4 py-6 text-right text-left">₩{(Number(p.totalRevenue) || 0).toLocaleString()}</td>
+                            <td className="px-4 py-6 text-right text-emerald-600 text-left">₩{Math.round(Number(p.dailyAvgRevenue) || 0).toLocaleString()}</td>
+                            <td className="px-4 py-6 text-right text-left">{(Number(p.cvr) || 0).toFixed(2)}%</td>
+                          </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                 </div>
               )}
+
+              {/* 상품 상세 트렌드 차트 */}
+              {Array.isArray(selectedProduct.history) && selectedProduct.history.length > 0 && (
+                <div className="h-80 bg-white p-10 rounded-[56px] border border-slate-100 shadow-2xl text-left">
+                  <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">상품 유입 변화 추이 그래프</h4>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={selectedProduct.history}>
+                      <defs><linearGradient id="colorProdViews" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.15}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area name="조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorProdViews)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
             </div>
-            <div className="p-12 bg-white border-t border-slate-50 flex justify-center text-left"><button onClick={() => setSelectedProduct(null)} className="px-32 py-6 bg-slate-900 text-white rounded-[32px] font-black text-lg shadow-xl text-left">창 닫기</button></div>
+            <div className="p-12 bg-white border-t border-slate-50 flex justify-center text-left"><button onClick={() => setSelectedProduct(null)} className="px-32 py-6 bg-slate-900 text-white rounded-[32px] font-black text-lg hover:scale-105 transition-all shadow-xl shadow-slate-200 text-left">데이터 창 닫기</button></div>
           </div>
         </div>
       )}
