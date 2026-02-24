@@ -145,7 +145,7 @@ const App = () => {
           let fullPayloadString = "";
 
           for(let i = 0; i < chunkCount; i++) {
-            setDownloadProgressText(`[데이터 수신 중] ${i + 1} / ${chunkCount} 블록...`);
+            setDownloadProgressText(`[데이터 수신 중] ${i + 1} / ${chunkCount} 조각 다운로드...`);
             const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `deploy_${deployId}_chunk_${i}`));
             if(snap.exists()) {
               fullPayloadString += snap.data().data;
@@ -192,19 +192,19 @@ const App = () => {
   }, [user, db, processedData.length]);
 
 
-  // --- 공용 클라우드 [안전한 분할 저장 및 전처리 배포] ---
+  // --- 공용 클라우드 [절대 멈추지 않는 안전 분할 저장] ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db) return;
     
     try {
-      setUploadProgressText(`[클라우드 전처리] 데이터를 가볍게 압축 중...`);
-      // 브라우저 멈춤 방지를 위한 비동기 양보
+      setUploadProgressText(`[클라우드 전처리] 데이터를 최적화 중입니다...`);
       await new Promise(r => setTimeout(r, 50));
 
       const cleanObj = JSON.parse(JSON.stringify(dataObj));
       const payloadString = JSON.stringify(cleanObj);
       
-      const chunkSize = 500000;
+      // 🔥 [핵심 수정] 한글 3바이트를 고려하여, 무조건 1MB 한계를 피하는 초안전 사이즈(8만자 = 약 240KB)로 분할
+      const chunkSize = 80000;
       const chunks = [];
       for (let i = 0; i < payloadString.length; i += chunkSize) {
         chunks.push(payloadString.substring(i, i + chunkSize));
@@ -212,13 +212,14 @@ const App = () => {
 
       const deployId = Date.now().toString();
 
+      // 병렬이 아닌 '순차적(Sequential)' 전송으로 네트워크 뻗음 방지
       for (let i = 0; i < chunks.length; i++) {
-        setUploadProgressText(`[클라우드 전송 중] ${i + 1} / ${chunks.length} 데이터 블록 업로드...`);
+        setUploadProgressText(`[클라우드 전송 중] ${i + 1} / ${chunks.length} 번째 블록 안전 업로드...`);
         const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `deploy_${deployId}_chunk_${i}`);
         await setDoc(chunkRef, { data: chunks[i] });
       }
 
-      setUploadProgressText(`[동기화 마무리] 팀원들에게 배포 신호 전송 중...`);
+      setUploadProgressText(`[동기화 마무리] 팀원들에게 배포 완료 신호 전송 중...`);
       const updatedAt = new Date().toISOString();
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
       await setDoc(metaRef, {
@@ -233,26 +234,34 @@ const App = () => {
         localStorage.setItem('sales_dashboard_meta_updatedAt', updatedAt);
       } catch(e) { console.warn("캐시 생략"); }
 
-      setStatusMessage({ type: 'success', text: '안전하게 팀 전체 데이터 공유가 완료되었습니다!' });
+      setStatusMessage({ type: 'success', text: '데이터베이스 업로드 완벽 성공! 팀원들에게 배포되었습니다.' });
 
+      // 백그라운드 청소 (사용자는 기다리지 않음, 에러 나도 무시)
       try {
         const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
         const allSnaps = await getDocs(payloadsCol);
+        
         let cleanupBatch = writeBatch(db);
         let opsCount = 0;
         
-        allSnaps.forEach(d => {
+        for (const d of allSnaps.docs) {
           if (!d.id.includes(deployId)) {
             cleanupBatch.delete(d.ref);
             opsCount++;
+            // Batch limit(500) 방지
+            if (opsCount === 400) {
+              await cleanupBatch.commit();
+              cleanupBatch = writeBatch(db);
+              opsCount = 0;
+            }
           }
-        });
+        }
         if (opsCount > 0) await cleanupBatch.commit();
-      } catch(e) { console.error("백그라운드 청소 실패 (무시됨)", e); }
+      } catch(e) { console.error("백그라운드 청소 실패 (기능 이상 없음)", e); }
 
     } catch (err) { 
       console.error("Sync error:", err);
-      throw new Error('클라우드 업로드 실패. 인터넷 연결을 확인해 주세요.'); 
+      throw new Error('클라우드 통신 장애. 네트워크를 확인해 주세요.'); 
     }
   };
 
@@ -302,9 +311,8 @@ const App = () => {
       for (let f = 0; f < targetFiles.length; f++) {
         const file = targetFiles[f];
         
-        // 1. 엑셀 파일 로드
         setUploadProgressText(`[데이터 추출 중] ${f+1}/${targetFiles.length} : '${file.name}' 읽는 중...`);
-        await new Promise(r => setTimeout(r, 20)); // 브라우저 숨쉬기 타임
+        await new Promise(r => setTimeout(r, 20)); 
         
         const dateStr = extractDate(file.name);
         if (dateStr !== '알 수 없는 날짜' && dateStr > currentMaxDate) currentMaxDate = dateStr;
@@ -312,7 +320,6 @@ const App = () => {
         
         const rawData = await parseExcel(file);
 
-        // 🔥 [전처리 핵심 로직] 불필요한 엑셀 열(수십개)을 모두 버리고, 필수 항목만 가볍게 구성합니다.
         setUploadProgressText(`[전처리 진행 중] ${f+1}/${targetFiles.length} : 핵심 데이터 정제 중...`);
         await new Promise(r => setTimeout(r, 20));
 
@@ -430,17 +437,29 @@ const App = () => {
         const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
         await deleteDoc(metaRef);
         
-        const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
-        const oldChunks = await getDocs(payloadsCol);
-        const batch = writeBatch(db);
-        oldChunks.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-
         setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
         localStorage.removeItem('sales_dashboard_local_data');
         localStorage.removeItem('sales_dashboard_meta_updatedAt');
 
         setStatusMessage({ type: 'success', text: '공용 데이터가 비워졌습니다.' });
+        
+        // 백그라운드 청소
+        const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+        const oldChunks = await getDocs(payloadsCol);
+        let batch = writeBatch(db);
+        let opsCount = 0;
+        
+        for (const d of oldChunks.docs) {
+          batch.delete(d.ref);
+          opsCount++;
+          if (opsCount === 400) {
+            await batch.commit();
+            batch = writeBatch(db);
+            opsCount = 0;
+          }
+        }
+        if (opsCount > 0) await batch.commit();
+
       } catch(e) { console.error("Delete error", e); }
     }
   };
@@ -495,7 +514,7 @@ const App = () => {
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '조회수 리포트' : '상품 성과 상세'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '모두가 보는 성장 리포트' : '상품 성과 상세'}</h2>
              <div className="flex items-center gap-2">
                <div className={`h-2 w-2 rounded-full ${isFetchingFromDB || isUploadingToDB ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Shared Board</span>
