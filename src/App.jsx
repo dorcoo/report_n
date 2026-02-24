@@ -36,16 +36,15 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 
 const App = () => {
-  // --- 데이터 상태 ---
+  // --- 데이터 상태 (오직 DB에서 내려온 데이터만 담습니다) ---
   const [processedData, setProcessedData] = useState([]);
   const [dailyTrend, setDailyTrend] = useState([]);
   const [monthlyTrend, setMonthlyTrend] = useState([]);
   const [globalMaxDate, setGlobalMaxDate] = useState('');
   
-  // --- UI 및 진행 상태 ---
-  const [isUploadingToDB, setIsUploadingToDB] = useState(false);
-  const [uploadProgressText, setUploadProgressText] = useState(''); // 상세 진행상황 텍스트
-  const [isFetchingFromDB, setIsFetchingFromDB] = useState(true);
+  // --- UI 및 진행 상태 (단계별 로딩 표시) ---
+  const [isUploadingToDB, setIsUploadingToDB] = useState(false); // 엑셀 파싱 -> DB 저장 단계
+  const [isFetchingFromDB, setIsFetchingFromDB] = useState(true); // DB에서 가져와서 화면 그리는 단계
   const [activeTab, setActiveTab] = useState('dashboard');
   const [searchTerm, setSearchTerm] = useState('');
   const [showOnlyNameChanged, setShowOnlyNameChanged] = useState(false);
@@ -58,32 +57,14 @@ const App = () => {
   // --- 인프라 상태 ---
   const [user, setUser] = useState(null);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
 
-  // 실시간 구독 충돌 방지
-  const isSyncingRef = useRef(false);
-  const isProcessingRef = useRef(false);
-
+  // 검색이나 정렬이 바뀌면 보이는 개수 초기화
   useEffect(() => {
     setVisibleCount(50);
   }, [searchTerm, sortConfig, showOnlyNameChanged, activeTab]);
 
-  // 1. 엑셀 라이브러리 및 로컬 캐시 로드
+  // 1. 엑셀 라이브러리 로드
   useEffect(() => {
-    const savedLocal = localStorage.getItem('sales_dashboard_local_data');
-    if (savedLocal) {
-      try {
-        const parsed = JSON.parse(savedLocal);
-        if (parsed.processedData && parsed.processedData.length > 0) {
-          setProcessedData(parsed.processedData);
-          setDailyTrend(parsed.dailyTrend || []);
-          setMonthlyTrend(parsed.monthlyTrend || []);
-          setGlobalMaxDate(parsed.globalMaxDate || '');
-          setIsFetchingFromDB(false); // 로컬에 데이터가 있으면 즉시 렌더링
-        }
-      } catch (e) { console.error("로컬 복구 실패", e); }
-    }
-
     if (!document.querySelector(`script[src="${EXCEL_LIB_URL}"]`)) {
       const script = document.createElement("script");
       script.src = EXCEL_LIB_URL;
@@ -116,69 +97,57 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 3. 진정한 '공용 DB' 실시간 동기화
+  // 3. [핵심 알고리즘 변경] 오직 DB 상태만 구독하고 화면을 업데이트합니다.
   useEffect(() => {
     if (!user) return;
     
     const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
     
     const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
-      if (isUploadingToDB || isSyncingRef.current || isProcessingRef.current) return;
-      
       if (metaSnap.exists()) {
         const meta = metaSnap.data();
-        const localUpdatedAt = localStorage.getItem('sales_dashboard_meta_updatedAt');
+        
+        // 내 브라우저에서 지금 데이터를 막 올리고 있는 중이라면 화면을 깜빡이지 않고 대기합니다.
+        // 업로드가 완전히 끝나면 isUploadingToDB가 false가 되면서 이때 화면이 새로 그려집니다.
+        if (isUploadingToDB) return;
 
-        // 이미 최신 버전을 가지고 있다면 초고속 패스! (불필요한 다운로드 방지)
-        if (meta.updatedAt && meta.updatedAt === localUpdatedAt) {
-          setIsFetchingFromDB(false);
-          return; 
-        }
-
-        const isFirstLoad = processedData.length === 0;
-        if (isFirstLoad) setIsFetchingFromDB(true);
-        else setStatusMessage({ type: 'info', text: '팀원이 업데이트한 데이터를 수신 중입니다...' });
+        setIsFetchingFromDB(true);
+        setStatusMessage({ type: 'info', text: 'DB에서 최신 데이터를 가져와 그래프를 그립니다...' });
 
         try {
-          // 메타데이터에 기록된 청크 개수만큼만 정확히 가져와 병합 (병렬 다운로드는 빠름)
-          const chunkCount = meta.chunkCount || 0;
-          let chunkPromises = [];
-          for (let i = 0; i < chunkCount; i++) {
-            chunkPromises.push(getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`)));
-          }
+          const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+          const chunkSnaps = await getDocs(payloadsCol);
           
-          const snaps = await Promise.all(chunkPromises);
-          const fullPayloadString = snaps.map(s => s.exists() ? s.data().data : "").join("");
+          let chunksArr = [];
+          chunkSnaps.forEach(d => {
+            const idx = parseInt(d.id.replace('chunk_', ''));
+            chunksArr[idx] = d.data().data;
+          });
           
-          if (fullPayloadString) {
-            const parsed = JSON.parse(fullPayloadString);
+          const fullPayload = chunksArr.join("");
+          
+          if (fullPayload) {
+            const parsed = JSON.parse(fullPayload);
+            // DB에서 내려온 데이터를 그대로 React 상태에 꽂아 넣습니다 (단일 진실 공급원)
             setProcessedData(parsed.processedData || []);
             setDailyTrend(parsed.dailyTrend || []);
             setMonthlyTrend(parsed.monthlyTrend || []);
             setGlobalMaxDate(parsed.globalMaxDate || '');
             
-            // 로컬 캐시에 저장하여 다음번 접속 시 0.1초 컷 보장
-            localStorage.setItem('sales_dashboard_local_data', fullPayloadString);
-            localStorage.setItem('sales_dashboard_meta_updatedAt', meta.updatedAt);
-            
-            if (meta.authorId !== user.uid && parsed.processedData?.length > 0) {
-              setStatusMessage({ type: 'success', text: '공용 데이터베이스 동기화가 완료되었습니다!' });
-            }
+            setStatusMessage({ type: 'success', text: '데이터베이스 동기화 완료!' });
           }
         } catch(e) {
-          console.error("Cloud fetch error:", e);
-          setStatusMessage({ type: 'error', text: '데이터 동기화 중 오류가 발생했습니다.' });
+          console.error("DB Fetch Error:", e);
+          setStatusMessage({ type: 'error', text: '데이터베이스에서 정보를 불러오는 중 오류가 발생했습니다.' });
         } finally {
           setIsFetchingFromDB(false);
         }
       } else {
-        // DB가 비워졌을 때
+        // DB가 텅 비었을 때
         setProcessedData([]);
         setDailyTrend([]);
         setMonthlyTrend([]);
         setGlobalMaxDate('');
-        localStorage.removeItem('sales_dashboard_local_data');
-        localStorage.removeItem('sales_dashboard_meta_updatedAt');
         setIsFetchingFromDB(false);
       }
     }, (error) => {
@@ -187,57 +156,51 @@ const App = () => {
     });
 
     return () => unsubscribe();
-  }, [user, db, isUploadingToDB, processedData.length]);
+  }, [user, db, isUploadingToDB]);
 
 
-  // --- 공용 클라우드 [순차적 분할 저장] ---
-  // 병목 방지를 위해 조각을 삭제하지 않고 덮어씌우며, Promise.all 대신 for문으로 하나씩 안전하게 쏩니다.
+  // --- 공용 클라우드 [Batch 네이티브 일괄 저장] ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db) return;
     
-    setIsSyncing(true);
-    isSyncingRef.current = true;
-    
     try {
       const payloadString = JSON.stringify(dataObj);
-      
-      // 약 300KB 단위로 분할 (더 잘게 쪼개어 네트워크 부하 최소화)
-      const CHUNK_SIZE = 300000; 
+      const chunkSize = 400000; 
       const chunks = [];
-      for (let i = 0; i < payloadString.length; i += CHUNK_SIZE) {
-        chunks.push(payloadString.substring(i, i + CHUNK_SIZE));
+      for (let i = 0; i < payloadString.length; i += chunkSize) {
+        chunks.push(payloadString.substring(i, i + chunkSize));
       }
 
-      // [핵심 변경] 병렬 업로드(Promise.all)가 파이어베이스를 뻗게 만들었으므로 순차적(Sequential) 업로드 진행!
+      const batch = writeBatch(db);
+      
+      // 구 조각 삭제
+      const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+      const oldChunks = await getDocs(payloadsCol);
+      oldChunks.forEach(d => batch.delete(d.ref));
+
+      // 신규 조각 추가
       for (let i = 0; i < chunks.length; i++) {
         const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`);
-        await setDoc(chunkRef, { data: chunks[i] });
+        batch.set(chunkRef, { data: chunks[i] });
       }
 
-      // 4. 메타데이터 업데이트 (이때 다른 팀원들의 화면이 일제히 갱신됨)
-      const updatedAt = new Date().toISOString();
+      // 메타데이터 업데이트 (이 순간 onSnapshot이 발동하여 화면을 업데이트함)
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
-      await setDoc(metaRef, {
+      batch.set(metaRef, {
         chunkCount: chunks.length,
-        updatedAt: updatedAt,
+        updatedAt: new Date().toISOString(),
         originalSize: payloadString.length,
         authorId: user.uid
       });
       
-      // 내 로컬 캐시 갱신
-      localStorage.setItem('sales_dashboard_local_data', payloadString);
-      localStorage.setItem('sales_dashboard_meta_updatedAt', updatedAt);
-
+      await batch.commit();
     } catch (err) { 
       console.error("Sync error:", err);
-      throw new Error('네트워크 연결이 끊겼거나 데이터가 너무 큽니다.');
-    } finally {
-      setIsSyncing(false);
-      isSyncingRef.current = false;
+      throw err;
     }
   };
 
-  // --- 엑셀 가공 로직 ---
+  // --- 엑셀 가공 및 즉시 DB 업로드 로직 ---
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -261,13 +224,12 @@ const App = () => {
     });
   };
 
-  // [초핵심 로직 변경] 1개 파일 분석 -> 1개 파일 DB 업로드 (순차 처리)
   const processFilesAndUpload = async (targetFiles) => {
     if (!isLibLoaded || !user) return;
-    if (targetFiles.length === 0) return;
-
+    
+    // 1단계: 엑셀 파싱 및 로컬 집계
     setIsUploadingToDB(true);
-    isProcessingRef.current = true;
+    setStatusMessage({ type: 'info', text: '1단계: 엑셀 데이터 분석 및 누적 병합 중...' });
     
     try {
       const productMap = new Map();
@@ -276,7 +238,7 @@ const App = () => {
       const productDailyHistory = new Map();
       let currentMaxDate = globalMaxDate;
 
-      // 기존 데이터 복원
+      // 이미 화면에 떠있는 데이터(이전에 DB에서 받아온 데이터)를 베이스로 삼음
       processedData.forEach(p => {
         productMap.set(p.상품ID, { ...p });
         productDailyHistory.set(p.상품ID, [...(p.history || [])]);
@@ -284,13 +246,7 @@ const App = () => {
       dailyTrend.forEach(d => dailyMap.set(d.date, { ...d }));
       monthlyTrend.forEach(m => monthlyMap.set(m.month, { ...m }));
 
-      // 파일을 "하나씩(Sequential)" 처리하고 매번 DB에 쏘아 올립니다.
-      for (let i = 0; i < targetFiles.length; i++) {
-        const file = targetFiles[i];
-        
-        // 1. 개별 파일 분석
-        setUploadProgressText(`[${i + 1}/${targetFiles.length}] '${file.name}' 분석 중...`);
-        
+      for (const file of targetFiles) {
         const dateStr = extractDate(file.name);
         if (dateStr !== '알 수 없는 날짜' && dateStr > currentMaxDate) currentMaxDate = dateStr;
         const monthStr = dateStr !== '알 수 없는 날짜' ? dateStr.substring(0, 7) : '알 수 없는 월';
@@ -334,54 +290,47 @@ const App = () => {
           if (existingDay) { existingDay.매출 += revenue; existingDay.조회수 += views; existingDay.판매량 += sales; }
           else { pHist.push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: currentName }); }
         });
-
-        // 2. 중간 집계 (해당 파일까지의 결과)
-        const finalDailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
-        const finalMonthlyTrend = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
-        const finalProducts = Array.from(productMap.values()).map(p => {
-          const history = (productDailyHistory.get(p.상품ID) || []).sort((a, b) => a.date.localeCompare(b.date));
-          const performanceByName = p.nameHistory.map(nh => {
-            const nameData = history.filter(h => h.nameUsed === nh.name);
-            const tRev = nameData.reduce((s, h) => s + h.매출, 0);
-            const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
-            const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
-            const days = Math.ceil(Math.abs(new Date(nh.end) - new Date(nh.start)) / (1000 * 60 * 60 * 24)) + 1;
-            return { 
-              name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews, 
-              dailyAvgViews: tViews / days, dailyAvgRevenue: tRev / days,
-              cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, days, periodStart: nh.start, periodEnd: nh.end 
-            };
-          }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
-          return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
-        });
-
-        // 내 화면을 먼저 업데이트! (체감 속도 증가)
-        setProcessedData(finalProducts);
-        setDailyTrend(finalDailyTrend);
-        setMonthlyTrend(finalMonthlyTrend);
-        setGlobalMaxDate(currentMaxDate);
-
-        // 3. 해당 시점의 데이터를 DB에 순차 등록
-        setUploadProgressText(`[${i + 1}/${targetFiles.length}] 데이터베이스에 등록 중...`);
-        const dataObj = {
-          processedData: finalProducts,
-          dailyTrend: finalDailyTrend,
-          monthlyTrend: finalMonthlyTrend,
-          globalMaxDate: currentMaxDate
-        };
-
-        // 한 파일 끝날 때마다 서버에 전송 (무한 로딩 방지 핵심)
-        await performCloudSync(dataObj);
       }
 
-      setStatusMessage({ type: 'success', text: '모든 파일의 분석 및 공유가 완료되었습니다!' });
+      const finalDailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+      const finalMonthlyTrend = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
+      const finalProducts = Array.from(productMap.values()).map(p => {
+        const history = (productDailyHistory.get(p.상품ID) || []).sort((a, b) => a.date.localeCompare(b.date));
+        const performanceByName = p.nameHistory.map(nh => {
+          const nameData = history.filter(h => h.nameUsed === nh.name);
+          const tRev = nameData.reduce((s, h) => s + h.매출, 0);
+          const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
+          const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
+          const days = Math.ceil(Math.abs(new Date(nh.end) - new Date(nh.start)) / (1000 * 60 * 60 * 24)) + 1;
+          return { 
+            name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews, 
+            dailyAvgViews: tViews / days, dailyAvgRevenue: tRev / days,
+            cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, days, periodStart: nh.start, periodEnd: nh.end 
+          };
+        }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
+        return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
+      });
+
+      const dataObj = {
+        processedData: finalProducts,
+        dailyTrend: finalDailyTrend,
+        monthlyTrend: finalMonthlyTrend,
+        globalMaxDate: currentMaxDate
+      };
+
+      // 2단계: 화면에 렌더링하지 않고 바로 DB로 직행! (DB 오프로딩)
+      setStatusMessage({ type: 'info', text: '2단계: 분석된 데이터를 공용 데이터베이스로 전송 중...' });
+      
+      await performCloudSync(dataObj);
+
+      setStatusMessage({ type: 'success', text: 'DB 전송 완료! 화면을 새로 고칩니다.' });
 
     } catch (err) { 
       console.error(err);
-      setStatusMessage({ type: 'error', text: err.message || '데이터 처리 중 오류가 발생했습니다.' }); 
+      setStatusMessage({ type: 'error', text: '데이터베이스 처리 중 오류가 발생했습니다.' }); 
     } finally {
+      // 업로드가 끝나면 isUploadingToDB를 false로 만들어 onSnapshot이 화면을 그리도록 허용
       setIsUploadingToDB(false);
-      isProcessingRef.current = false;
     }
   };
 
@@ -406,14 +355,17 @@ const App = () => {
   const clearData = async () => {
     if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속 중인 모든 사용자의 화면이 즉시 텅 비게 됩니다.")) {
       try {
+        const batch = writeBatch(db);
         const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
-        await deleteDoc(metaRef);
+        batch.delete(metaRef);
         
-        // 지우는 과정은 백그라운드에서 실행 (UI는 즉시 비워짐)
-        setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
-        localStorage.removeItem('sales_dashboard_local_data');
-        localStorage.removeItem('sales_dashboard_meta_updatedAt');
+        const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+        const oldChunks = await getDocs(payloadsCol);
+        oldChunks.forEach(d => batch.delete(d.ref));
+        
+        await batch.commit();
 
+        setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
         setStatusMessage({ type: 'success', text: '공용 데이터가 성공적으로 지워졌습니다.' });
       } catch(e) { console.error("Delete error", e); }
     }
@@ -449,7 +401,7 @@ const App = () => {
             <div className={`p-2.5 rounded-xl shadow-md transition-transform ${isUploadingToDB ? 'bg-slate-200 animate-pulse' : 'bg-white group-hover:scale-110'}`}>
               <Upload size={22} className={isUploadingToDB ? 'text-slate-400' : 'text-blue-600'} />
             </div>
-            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600 text-center">{isUploadingToDB ? '업로드 중...' : '공용 데이터 합치기'}</span>}
+            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600 text-center">{isUploadingToDB ? 'DB 처리 중...' : '공용 데이터 합치기'}</span>}
           </div>
           {!isSidebarCollapsed && (
             <div className="px-3 py-3 bg-blue-50/50 border border-blue-100 rounded-xl flex items-center gap-3 shadow-inner">
@@ -469,27 +421,27 @@ const App = () => {
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '조회수 리포트' : '상품 성과 상세'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '모두가 보는 성장 리포트' : '상품 성과 상세'}</h2>
              <div className="flex items-center gap-2">
-               <div className={`h-2 w-2 rounded-full ${isFetchingFromDB || isUploadingToDB ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
+               <div className={`h-2 w-2 rounded-full ${isFetchingFromDB ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Shared Board</span>
-               {isFetchingFromDB && !isUploadingToDB && <div className="flex items-center gap-1.5 text-[10px] text-blue-500 font-black animate-pulse"><RefreshCw size={10} className="animate-spin" /> 서버에서 불러오는 중...</div>}
+               {isFetchingFromDB && !isUploadingToDB && <div className="flex items-center gap-1.5 text-[10px] text-blue-500 font-black animate-pulse"><RefreshCw size={10} className="animate-spin" /> DB에서 읽어오는 중...</div>}
              </div>
           </div>
           <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90"><Menu size={22} /></button>
         </header>
 
         <div className="p-10 max-w-[1500px] mx-auto space-y-10">
-          {isFetchingFromDB && processedData.length === 0 ? (
+          {isFetchingFromDB ? (
             <div className="h-[60vh] flex flex-col items-center justify-center">
               <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
-              <p className="font-black text-slate-400 tracking-widest uppercase text-xs mt-4">데이터베이스 동기화 및 렌더링 중...</p>
+              <p className="font-black text-slate-400 tracking-widest uppercase text-xs">데이터베이스 동기화 및 렌더링 중...</p>
             </div>
           ) : processedData.length === 0 ? (
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
               <div className="bg-slate-50 p-8 rounded-full mb-8"><Database size={64} className="text-blue-200" /></div>
               <h3 className="text-2xl font-black text-slate-900 mb-2 italic">데이터베이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium text-center">엑셀 파일을 하나씩 올릴 때마다 파이어베이스에 즉시 순차 저장됩니다.<br/>수십 메가바이트의 파일도 절대 멈추지 않습니다.</p>
+              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하면 데이터가 추출되어 공용 DB에 즉시 저장됩니다.<br/>이제부터 브라우저는 오직 DB 데이터만 바라봅니다.</p>
             </div>
           ) : (
             <>
@@ -708,7 +660,7 @@ const App = () => {
         <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-5 bg-slate-900/90 backdrop-blur-2xl rounded-[28px] shadow-2xl border border-slate-700 flex items-center gap-4 z-[100] animate-in slide-in-from-bottom-8">
           <div className="w-5 h-5 border-4 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
           <span className="font-black text-white tracking-tighter italic">
-            {uploadProgressText || '데이터베이스 통신 준비 중...'}
+            공용 DB로 업로드 중...
           </span>
         </div>
       )}
