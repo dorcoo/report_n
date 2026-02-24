@@ -3,7 +3,7 @@ import {
   Upload, BarChart3, TrendingUp, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
   ChevronRight, X, LayoutDashboard, 
-  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play
+  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight
 } from 'lucide-react';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, 
@@ -11,12 +11,18 @@ import {
 } from 'recharts';
 
 /**
- * [최종 확정] 서버 주소 설정
+ * [설정] 서버 주소 및 접속 암호
  */
 const SERVER_URL = 'https://report-backend-0fwr.onrender.com';
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
+const APP_PASSWORD = '121213'; // 여기에 사용할 암호를 설정하세요.
 
 const App = () => {
+  // --- 인증 상태 ---
+  const [isAuthorized, setIsAuthorized] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
+  const [loginError, setLoginError] = useState(false);
+
   // --- 데이터 상태 ---
   const [processedData, setProcessedData] = useState([]);
   const [dailyTrend, setDailyTrend] = useState([]);
@@ -38,7 +44,15 @@ const App = () => {
   const [isWakingUp, setIsWakingUp] = useState(false);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
 
-  // 1. 엑셀 라이브러리 동적 로드
+  // 1. 초기 인증 체크 (세션 유지)
+  useEffect(() => {
+    const savedAuth = sessionStorage.getItem('is_pro_authorized');
+    if (savedAuth === 'true') {
+      setIsAuthorized(true);
+    }
+  }, []);
+
+  // 2. 엑셀 라이브러리 동적 로드
   useEffect(() => {
     if (!document.querySelector(`script[src="${EXCEL_LIB_URL}"]`)) {
       const script = document.createElement("script");
@@ -58,6 +72,8 @@ const App = () => {
    * 서버(DB)에서 최신 데이터를 가져오는 함수
    */
   const fetchDashboardData = async () => {
+    if (!isAuthorized) return; // 인증되지 않았으면 호출 금지
+    
     setIsFetching(true);
     setHasConnectionError(false);
     
@@ -84,8 +100,25 @@ const App = () => {
   };
 
   useEffect(() => {
-    fetchDashboardData();
-  }, []);
+    if (isAuthorized) {
+      fetchDashboardData();
+    }
+  }, [isAuthorized]);
+
+  /**
+   * 로그인 핸들러
+   */
+  const handleLogin = (e) => {
+    e.preventDefault();
+    if (passwordInput === APP_PASSWORD) {
+      setIsAuthorized(true);
+      setLoginError(false);
+      sessionStorage.setItem('is_pro_authorized', 'true');
+    } else {
+      setLoginError(true);
+      setPasswordInput('');
+    }
+  };
 
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
@@ -240,12 +273,58 @@ const App = () => {
 
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
+  /**
+   * 로그인 화면 렌더링
+   */
+  if (!isAuthorized) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6 font-sans">
+        <div className="w-full max-w-md animate-in fade-in zoom-in-95 duration-500">
+          <div className="bg-white rounded-[48px] shadow-2xl shadow-indigo-100 border border-slate-100 overflow-hidden">
+            <div className="bg-emerald-600 p-12 text-center text-white">
+              <div className="inline-flex p-5 bg-white/20 rounded-[32px] mb-8 backdrop-blur-md">
+                <Lock size={40} strokeWidth={2.5} />
+              </div>
+              <h1 className="text-3xl font-black tracking-tighter mb-2 italic">SALES ANALYSIS</h1>
+              <p className="text-emerald-100 font-bold text-sm tracking-widest uppercase opacity-80">Professional Dashboard</p>
+            </div>
+            <div className="p-12">
+              <form onSubmit={handleLogin} className="space-y-6">
+                <div>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-3 ml-1">Access Password</label>
+                  <div className="relative group">
+                    <input 
+                      type="password" 
+                      value={passwordInput}
+                      onChange={(e) => setPasswordInput(e.target.value)}
+                      placeholder="••••"
+                      className={`w-full px-8 py-5 bg-slate-50 border ${loginError ? 'border-rose-300 ring-4 ring-rose-50' : 'border-slate-100 group-hover:border-emerald-200'} rounded-[24px] focus:outline-none focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 transition-all font-black text-xl tracking-widest text-center`}
+                    />
+                    {loginError && <p className="text-rose-500 text-xs font-black mt-3 text-center animate-bounce">암호가 일치하지 않습니다.</p>}
+                  </div>
+                </div>
+                <button 
+                  type="submit" 
+                  className="w-full bg-slate-900 text-white py-6 rounded-[24px] font-black text-lg hover:bg-emerald-600 hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-slate-200 flex items-center justify-center gap-3 group"
+                >
+                  대시보드 입장 <ArrowRight size={20} className="group-hover:translate-x-1 transition-transform" />
+                </button>
+              </form>
+            </div>
+          </div>
+          <p className="text-center mt-10 text-slate-300 text-[10px] font-black tracking-[0.3em] uppercase">Security Powered by PRO Engine</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- 메인 대시보드 렌더링 ---
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans">
       <aside className={`fixed left-0 top-0 h-full bg-white border-r border-slate-200 z-30 flex flex-col transition-all duration-300 ${isSidebarCollapsed ? 'w-20' : 'w-64'}`}>
         <div className="p-6 flex items-center gap-3 border-b border-slate-50 text-left">
           <div className="bg-emerald-600 p-2 rounded-xl text-white shadow-xl shrink-0"><Server size={20} /></div>
-          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900 text-left">판매분석 <span className="text-emerald-600 font-bold text-sm ml-1 uppercase italic">PRO</span></h1>}
+          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900 text-left">판매분석 <span className="text-emerald-600 font-bold text-sm ml-1 uppercase italic text-left">PRO</span></h1>}
         </div>
         
         <nav className="flex-1 px-4 py-6 space-y-2">
@@ -280,6 +359,17 @@ const App = () => {
                   </p>
                </div>
             </div>
+          )}
+          {!isSidebarCollapsed && (
+            <button 
+              onClick={() => {
+                sessionStorage.removeItem('is_pro_authorized');
+                setIsAuthorized(false);
+              }}
+              className="w-full flex items-center justify-center gap-2 p-3 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl text-xs font-bold transition-all"
+            >
+              <Lock size={12} /> 로그아웃
+            </button>
           )}
         </div>
       </aside>
