@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, deleteDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, collection, getDocs, writeBatch, onSnapshot, deleteDoc } from 'firebase/firestore';
 
 // 외부 라이브러리 (엑셀 파싱 전용)
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
@@ -44,6 +44,7 @@ const App = () => {
   
   // --- UI 및 진행 상태 ---
   const [isUploadingToDB, setIsUploadingToDB] = useState(false);
+  const [uploadProgressText, setUploadProgressText] = useState(''); // 상세 진행상황 텍스트
   const [isFetchingFromDB, setIsFetchingFromDB] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [searchTerm, setSearchTerm] = useState('');
@@ -57,6 +58,7 @@ const App = () => {
   // --- 인프라 상태 ---
   const [user, setUser] = useState(null);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
 
   // 실시간 구독 충돌 방지
   const isSyncingRef = useRef(false);
@@ -114,7 +116,7 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 3. 진정한 '공용 DB' 실시간 동기화 (파이어베이스 병목 완벽 제거 버전)
+  // 3. 진정한 '공용 DB' 실시간 동기화
   useEffect(() => {
     if (!user) return;
     
@@ -138,7 +140,7 @@ const App = () => {
         else setStatusMessage({ type: 'info', text: '팀원이 업데이트한 데이터를 수신 중입니다...' });
 
         try {
-          // [핵심 최적화] 메타데이터에 기록된 청크 개수만큼만 정확히 가져와 병합 (빠르고 가벼움)
+          // 메타데이터에 기록된 청크 개수만큼만 정확히 가져와 병합 (병렬 다운로드는 빠름)
           const chunkCount = meta.chunkCount || 0;
           let chunkPromises = [];
           for (let i = 0; i < chunkCount; i++) {
@@ -164,8 +166,8 @@ const App = () => {
             }
           }
         } catch(e) {
-          console.error("DB Fetch Error:", e);
-          setStatusMessage({ type: 'error', text: '데이터를 가져오는 중 네트워크 오류가 발생했습니다.' });
+          console.error("Cloud fetch error:", e);
+          setStatusMessage({ type: 'error', text: '데이터 동기화 중 오류가 발생했습니다.' });
         } finally {
           setIsFetchingFromDB(false);
         }
@@ -188,7 +190,8 @@ const App = () => {
   }, [user, db, isUploadingToDB, processedData.length]);
 
 
-  // --- 공용 클라우드 초고속 분할 저장 (파이어베이스 뻗음 현상 원천 차단) ---
+  // --- 공용 클라우드 [순차적 분할 저장] ---
+  // 병목 방지를 위해 조각을 삭제하지 않고 덮어씌우며, Promise.all 대신 for문으로 하나씩 안전하게 쏩니다.
   const performCloudSync = async (dataObj) => {
     if (!user || !db) return;
     
@@ -196,24 +199,20 @@ const App = () => {
     isSyncingRef.current = true;
     
     try {
-      // 1. 객체를 무거운 파이어베이스 배열 대신 가벼운 하나의 텍스트(String)로 변환
       const payloadString = JSON.stringify(dataObj);
       
-      // 2. 파이어베이스가 부담을 느끼지 않는 크기(약 600KB)로 분할
+      // 약 300KB 단위로 분할 (더 잘게 쪼개어 네트워크 부하 최소화)
       const CHUNK_SIZE = 300000; 
       const chunks = [];
       for (let i = 0; i < payloadString.length; i += CHUNK_SIZE) {
         chunks.push(payloadString.substring(i, i + CHUNK_SIZE));
       }
 
-      // 3. Batch 방식 대신 개별 Promise 병렬 전송으로 10MB 제한 돌파 및 속도 극대화
-      const uploadPromises = chunks.map((chunkStr, i) => {
+      // [핵심 변경] 병렬 업로드(Promise.all)가 파이어베이스를 뻗게 만들었으므로 순차적(Sequential) 업로드 진행!
+      for (let i = 0; i < chunks.length; i++) {
         const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`);
-        return setDoc(chunkRef, { data: chunkStr });
-      });
-
-      // 모든 조각을 동시에 쏴올림 (1.35MB 기준 1~2초 내 완료)
-      await Promise.all(uploadPromises);
+        await setDoc(chunkRef, { data: chunks[i] });
+      }
 
       // 4. 메타데이터 업데이트 (이때 다른 팀원들의 화면이 일제히 갱신됨)
       const updatedAt = new Date().toISOString();
@@ -228,12 +227,10 @@ const App = () => {
       // 내 로컬 캐시 갱신
       localStorage.setItem('sales_dashboard_local_data', payloadString);
       localStorage.setItem('sales_dashboard_meta_updatedAt', updatedAt);
-      
-      setStatusMessage({ type: 'success', text: '데이터베이스 업로드 완료! 팀원들에게 즉시 배포되었습니다.' });
 
     } catch (err) { 
       console.error("Sync error:", err);
-      setStatusMessage({ type: 'error', text: '네트워크 연결이 끊겼거나 데이터가 너무 큽니다.' }); 
+      throw new Error('네트워크 연결이 끊겼거나 데이터가 너무 큽니다.');
     } finally {
       setIsSyncing(false);
       isSyncingRef.current = false;
@@ -264,12 +261,13 @@ const App = () => {
     });
   };
 
+  // [초핵심 로직 변경] 1개 파일 분석 -> 1개 파일 DB 업로드 (순차 처리)
   const processFilesAndUpload = async (targetFiles) => {
     if (!isLibLoaded || !user) return;
-    
+    if (targetFiles.length === 0) return;
+
     setIsUploadingToDB(true);
     isProcessingRef.current = true;
-    setStatusMessage({ type: 'info', text: '엑셀 데이터 분석 및 누적 집계 중...' });
     
     try {
       const productMap = new Map();
@@ -278,6 +276,7 @@ const App = () => {
       const productDailyHistory = new Map();
       let currentMaxDate = globalMaxDate;
 
+      // 기존 데이터 복원
       processedData.forEach(p => {
         productMap.set(p.상품ID, { ...p });
         productDailyHistory.set(p.상품ID, [...(p.history || [])]);
@@ -285,7 +284,13 @@ const App = () => {
       dailyTrend.forEach(d => dailyMap.set(d.date, { ...d }));
       monthlyTrend.forEach(m => monthlyMap.set(m.month, { ...m }));
 
-      for (const file of targetFiles) {
+      // 파일을 "하나씩(Sequential)" 처리하고 매번 DB에 쏘아 올립니다.
+      for (let i = 0; i < targetFiles.length; i++) {
+        const file = targetFiles[i];
+        
+        // 1. 개별 파일 분석
+        setUploadProgressText(`[${i + 1}/${targetFiles.length}] '${file.name}' 분석 중...`);
+        
         const dateStr = extractDate(file.name);
         if (dateStr !== '알 수 없는 날짜' && dateStr > currentMaxDate) currentMaxDate = dateStr;
         const monthStr = dateStr !== '알 수 없는 날짜' ? dateStr.substring(0, 7) : '알 수 없는 월';
@@ -329,48 +334,51 @@ const App = () => {
           if (existingDay) { existingDay.매출 += revenue; existingDay.조회수 += views; existingDay.판매량 += sales; }
           else { pHist.push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: currentName }); }
         });
+
+        // 2. 중간 집계 (해당 파일까지의 결과)
+        const finalDailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+        const finalMonthlyTrend = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
+        const finalProducts = Array.from(productMap.values()).map(p => {
+          const history = (productDailyHistory.get(p.상품ID) || []).sort((a, b) => a.date.localeCompare(b.date));
+          const performanceByName = p.nameHistory.map(nh => {
+            const nameData = history.filter(h => h.nameUsed === nh.name);
+            const tRev = nameData.reduce((s, h) => s + h.매출, 0);
+            const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
+            const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
+            const days = Math.ceil(Math.abs(new Date(nh.end) - new Date(nh.start)) / (1000 * 60 * 60 * 24)) + 1;
+            return { 
+              name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews, 
+              dailyAvgViews: tViews / days, dailyAvgRevenue: tRev / days,
+              cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, days, periodStart: nh.start, periodEnd: nh.end 
+            };
+          }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
+          return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
+        });
+
+        // 내 화면을 먼저 업데이트! (체감 속도 증가)
+        setProcessedData(finalProducts);
+        setDailyTrend(finalDailyTrend);
+        setMonthlyTrend(finalMonthlyTrend);
+        setGlobalMaxDate(currentMaxDate);
+
+        // 3. 해당 시점의 데이터를 DB에 순차 등록
+        setUploadProgressText(`[${i + 1}/${targetFiles.length}] 데이터베이스에 등록 중...`);
+        const dataObj = {
+          processedData: finalProducts,
+          dailyTrend: finalDailyTrend,
+          monthlyTrend: finalMonthlyTrend,
+          globalMaxDate: currentMaxDate
+        };
+
+        // 한 파일 끝날 때마다 서버에 전송 (무한 로딩 방지 핵심)
+        await performCloudSync(dataObj);
       }
 
-      const finalDailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
-      const finalMonthlyTrend = Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
-      const finalProducts = Array.from(productMap.values()).map(p => {
-        const history = (productDailyHistory.get(p.상품ID) || []).sort((a, b) => a.date.localeCompare(b.date));
-        const performanceByName = p.nameHistory.map(nh => {
-          const nameData = history.filter(h => h.nameUsed === nh.name);
-          const tRev = nameData.reduce((s, h) => s + h.매출, 0);
-          const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
-          const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
-          const days = Math.ceil(Math.abs(new Date(nh.end) - new Date(nh.start)) / (1000 * 60 * 60 * 24)) + 1;
-          return { 
-            name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews, 
-            dailyAvgViews: tViews / days, dailyAvgRevenue: tRev / days,
-            cvr: tViews > 0 ? (tSales / tViews) * 100 : 0, days, periodStart: nh.start, periodEnd: nh.end 
-          };
-        }).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
-        return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
-      });
-
-      const dataObj = {
-        processedData: finalProducts,
-        dailyTrend: finalDailyTrend,
-        monthlyTrend: finalMonthlyTrend,
-        globalMaxDate: currentMaxDate
-      };
-
-      // 내 화면 렌더링을 먼저 해버리고 백그라운드 전송
-      setProcessedData(finalProducts);
-      setDailyTrend(finalDailyTrend);
-      setMonthlyTrend(finalMonthlyTrend);
-      setGlobalMaxDate(currentMaxDate);
-
-      setStatusMessage({ type: 'info', text: '분석 완료! 데이터를 서버로 업로드합니다...' });
-      
-      // DB로 백그라운드 초고속 전송
-      await performCloudSync(dataObj);
+      setStatusMessage({ type: 'success', text: '모든 파일의 분석 및 공유가 완료되었습니다!' });
 
     } catch (err) { 
       console.error(err);
-      setStatusMessage({ type: 'error', text: '데이터 처리 중 오류가 발생했습니다.' }); 
+      setStatusMessage({ type: 'error', text: err.message || '데이터 처리 중 오류가 발생했습니다.' }); 
     } finally {
       setIsUploadingToDB(false);
       isProcessingRef.current = false;
@@ -461,7 +469,7 @@ const App = () => {
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '모두가 보는 성장 리포트' : '상품 성과 상세'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '조회수 리포트' : '상품 성과 상세'}</h2>
              <div className="flex items-center gap-2">
                <div className={`h-2 w-2 rounded-full ${isFetchingFromDB || isUploadingToDB ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Shared Board</span>
@@ -481,7 +489,7 @@ const App = () => {
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
               <div className="bg-slate-50 p-8 rounded-full mb-8"><Database size={64} className="text-blue-200" /></div>
               <h3 className="text-2xl font-black text-slate-900 mb-2 italic">데이터베이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하면 데이터가 즉시 파이어베이스에 업로드됩니다.<br/>이제 수 초 안에 모든 브라우저가 동기화됩니다!</p>
+              <p className="text-slate-400 font-medium text-center">엑셀 파일을 하나씩 올릴 때마다 파이어베이스에 즉시 순차 저장됩니다.<br/>수십 메가바이트의 파일도 절대 멈추지 않습니다.</p>
             </div>
           ) : (
             <>
@@ -695,12 +703,12 @@ const App = () => {
         </div>
       )}
 
-      {/* 업로드/전송 중 UI 피드백 (화면 중앙 플로팅) */}
+      {/* 업로드/전송 중 UI 피드백 (화면 중앙 플로팅, 전체 화면 멈춤 차단) */}
       {isUploadingToDB && (
         <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-5 bg-slate-900/90 backdrop-blur-2xl rounded-[28px] shadow-2xl border border-slate-700 flex items-center gap-4 z-[100] animate-in slide-in-from-bottom-8">
           <div className="w-5 h-5 border-4 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
           <span className="font-black text-white tracking-tighter italic">
-            데이터베이스로 초고속 전송 중...
+            {uploadProgressText || '데이터베이스 통신 준비 중...'}
           </span>
         </div>
       )}
