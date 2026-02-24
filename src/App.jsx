@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
   Upload, Download, BarChart3, TrendingUp, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
@@ -13,7 +13,7 @@ import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, doc, setDoc, getDoc, collection, getDocs, writeBatch, onSnapshot, deleteDoc } from 'firebase/firestore';
 
-// 외부 라이브러리
+// 외부 라이브러리 (데이터 파싱 및 초고효율 압축)
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
 const COMPRESS_LIB_URL = "https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js";
 
@@ -43,7 +43,7 @@ const App = () => {
   const [monthlyTrend, setMonthlyTrend] = useState([]);
   const [globalMaxDate, setGlobalMaxDate] = useState('');
   
-  // --- UI 상태 ---
+  // --- UI 및 진행 상태 ---
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -59,7 +59,14 @@ const App = () => {
   const [isLibLoaded, setIsLibLoaded] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
 
-  // 1. 외부 라이브러리 로드
+  // 실시간 구독 충돌 방지를 위한 Ref
+  const isProcessingRef = useRef(false);
+  const isSyncingRef = useRef(false);
+
+  const setProcessingState = (val) => { setIsProcessing(val); isProcessingRef.current = val; };
+  const setSyncingState = (val) => { setIsSyncing(val); isSyncingRef.current = val; };
+
+  // 1. 외부 라이브러리 안전 로드
   useEffect(() => {
     const loadScripts = async () => {
       const scripts = [EXCEL_LIB_URL, COMPRESS_LIB_URL];
@@ -78,7 +85,7 @@ const App = () => {
     loadScripts();
   }, []);
 
-  // 2. 인증 관리
+  // 2. 인증 관리 (익명 로그인 보장)
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -87,7 +94,10 @@ const App = () => {
         } else {
           await signInAnonymously(auth);
         }
-      } catch (error) { console.error("Auth error", error); }
+      } catch (error) { 
+        console.error("인증 오류:", error); 
+        setStatusMessage({ type: 'error', text: '인증 실패: 콘솔에서 Anonymous 로그인을 활성화해주세요.' });
+      }
     };
     initAuth();
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -97,16 +107,16 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 3. 공용 데이터베이스 실시간 구독 (Real-time Sync)
+  // 3. 진정한 '공용 데이터베이스' 실시간 동기화 (로컬 캐시 배제)
   useEffect(() => {
     if (!user) return;
     
-    // 모두가 공유하는 Public 경로
+    // 모두가 공유하는 유일한 메타데이터 경로
     const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
     
     const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
-      // 내가 데이터를 올리거나 처리 중일 때는 덮어쓰기 방지
-      if (isProcessing || isSyncing) return;
+      // 내가 데이터를 올리고 있거나 파싱 중일 때는 화면 덮어쓰기 방지
+      if (isProcessingRef.current || isSyncingRef.current) return;
       
       if (metaSnap.exists() && window.LZString) {
         setIsInitialLoading(true);
@@ -130,18 +140,19 @@ const App = () => {
             setMonthlyTrend(parsed.monthlyTrend || []);
             setGlobalMaxDate(parsed.globalMaxDate || '');
             
-            // 데이터가 새로 들어왔을 때만 메시지 띄우기
+            // 데이터가 비어있지 않을 때만 성공 알림
             if (parsed.processedData?.length > 0) {
-              setStatusMessage({ type: 'success', text: '공용 데이터베이스가 동기화되었습니다.' });
+              setStatusMessage({ type: 'success', text: '팀 워크스페이스의 최신 데이터를 불러왔습니다.' });
             }
           }
         } catch(e) {
-          console.error("Cloud fetch error", e);
+          console.error("Cloud fetch error:", e);
+          setStatusMessage({ type: 'error', text: '데이터 동기화에 실패했습니다.' });
         } finally {
           setIsInitialLoading(false);
         }
       } else if (!metaSnap.exists()) {
-        // DB가 비워졌을 때
+        // 공용 DB가 지워졌을 경우 화면 즉시 클리어
         setProcessedData([]);
         setIsInitialLoading(false);
       }
@@ -151,42 +162,46 @@ const App = () => {
     });
 
     return () => unsubscribe();
-  }, [user, isProcessing, isSyncing]);
+  }, [user, db]);
 
-  // 공용 클라우드에 분할 저장 (1MB 한계 극복)
+  // --- 공용 클라우드 분할 저장 로직 (1MB 돌파의 핵심) ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db || !window.LZString) return;
-    setIsSyncing(true);
+    
+    setSyncingState(true);
+    setStatusMessage({ type: 'info', text: '데이터를 분할하여 팀원들에게 배포하고 있습니다...' });
+    
     try {
       const payloadString = JSON.stringify(dataObj);
       const compressedPayload = window.LZString.compressToUTF16(payloadString);
       
-      // 800KB 단위 분할
-      const chunkSize = 800000; 
+      // [핵심 변경] Firestore 1MB 제한을 확실하게 피하기 위해 약 500KB(25만자) 단위로 더 잘게 쪼갬
+      const chunkSize = 250000; 
       const chunks = [];
       for (let i = 0; i < compressedPayload.length; i += chunkSize) {
         chunks.push(compressedPayload.substring(i, i + chunkSize));
       }
 
-      // 1. 공용 공간에 순차적 청크 저장
+      // 1. 공용 공간에 순차적으로 조각 저장 (네트워크 안정성 확보)
       for (let i = 0; i < chunks.length; i++) {
         await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`), { data: chunks[i] });
       }
 
-      // 2. 메타데이터 업데이트 (이때 다른 접속자들의 onSnapshot이 트리거됨)
+      // 2. 메타데이터 최종 업데이트 (이 순간 다른 팀원들의 화면이 일제히 업데이트 됨)
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
       await setDoc(metaRef, {
         chunkCount: chunks.length,
         updatedAt: new Date().toISOString(),
         originalSize: payloadString.length,
-        authorId: user.uid // 마지막 업데이트한 사람 추적용
+        authorId: user.uid
       });
       
+      setStatusMessage({ type: 'success', text: '모든 사람의 대시보드에 최신 데이터가 반영되었습니다!' });
     } catch (err) { 
-      console.error("Sync error", err);
-      setStatusMessage({ type: 'error', text: '클라우드 저장 실패: 권한 또는 용량 문제를 확인하세요.' });
+      console.error("Sync error:", err);
+      setStatusMessage({ type: 'error', text: '클라우드 저장 실패: 용량이 너무 크거나 인터넷 연결이 불안정합니다.' });
     } finally { 
-      setIsSyncing(false); 
+      setSyncingState(false); 
     }
   };
 
@@ -216,7 +231,7 @@ const App = () => {
 
   const processFiles = async (targetFiles) => {
     if (!isLibLoaded) return;
-    setIsProcessing(true);
+    setProcessingState(true);
     
     const productMap = new Map();
     const dailyMap = new Map();
@@ -224,7 +239,7 @@ const App = () => {
     const productDailyHistory = new Map();
     let currentMaxDate = globalMaxDate;
 
-    // 공용 DB에 있던 기존 데이터를 바탕으로 맵 생성
+    // 공용 DB에 있던 기존 데이터를 바탕으로 맵 생성 (누적)
     processedData.forEach(p => {
       productMap.set(p.상품ID, { ...p });
       productDailyHistory.set(p.상품ID, [...(p.history || [])]);
@@ -295,20 +310,19 @@ const App = () => {
         return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
       });
 
-      // 1단계: 분석 완료 즉시 UI 갱신 (빠른 반응성)
+      // UI 업데이트 후 파일 읽기 종료
       setProcessedData(finalProducts);
       setDailyTrend(finalDailyTrend);
       setMonthlyTrend(finalMonthlyTrend);
       setGlobalMaxDate(currentMaxDate);
-      setIsProcessing(false);
-      setStatusMessage({ type: 'success', text: `데이터 병합 완료! 모두에게 업데이트를 배포합니다.` });
+      setProcessingState(false);
 
-      // 2단계: 백그라운드 공용 클라우드에 저장
+      // 브라우저 백그라운드에서 동기화 수행
       performCloudSync({ processedData: finalProducts, dailyTrend: finalDailyTrend, monthlyTrend: finalMonthlyTrend, globalMaxDate: currentMaxDate });
       
     } catch (err) { 
       console.error(err);
-      setIsProcessing(false);
+      setProcessingState(false);
       setStatusMessage({ type: 'error', text: '데이터 가공 중 오류가 발생했습니다.' }); 
     }
   };
@@ -332,27 +346,21 @@ const App = () => {
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
   const clearData = async () => {
-    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속한 모든 사용자의 화면에서도 데이터가 지워집니다.")) {
+    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속한 모든 사용자의 화면에서도 실시간으로 데이터가 지워집니다.")) {
       setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
       
-      // 메타데이터 삭제 (다른 클라이언트들에게 비워짐 알림)
-      const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
-      await deleteDoc(metaRef);
-
-      // 청크 삭제 (백그라운드 처리)
-      const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
-      const existingChunks = await getDocs(payloadsCol);
-      const batch = writeBatch(db);
-      existingChunks.forEach((d) => batch.delete(d.ref));
-      await batch.commit();
-
-      setStatusMessage({ type: 'success', text: '공용 데이터가 완전히 초기화되었습니다.' });
+      try {
+        const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
+        await deleteDoc(metaRef);
+        setStatusMessage({ type: 'success', text: '공용 데이터가 완전히 초기화되었습니다.' });
+      } catch(e) {
+        console.error("Delete error", e);
+      }
     }
   };
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans">
-      {/* 사이드바 */}
       <aside className={`fixed left-0 top-0 h-full bg-white border-r border-slate-200 z-30 flex flex-col transition-all duration-300 ${isSidebarCollapsed ? 'w-20' : 'w-64'}`}>
         <div className="p-6 flex items-center gap-3 border-b border-slate-50">
           <div className="bg-blue-600 p-2 rounded-xl text-white shadow-xl shrink-0 transition-transform active:scale-95"><Users size={20} /></div>
@@ -379,7 +387,7 @@ const App = () => {
                <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shrink-0"><Cloud size={14} /></div>
                <div className="min-w-0">
                   <p className="text-[9px] font-black text-blue-500 uppercase tracking-widest leading-none mb-1">Public Workspace</p>
-                  <p className="text-[10px] text-blue-700 font-bold truncate">공용 DB 연결 완료</p>
+                  <p className="text-[10px] text-blue-700 font-bold truncate">모두와 연결되어 있습니다</p>
                </div>
             </div>
           )}
@@ -389,7 +397,6 @@ const App = () => {
         </div>
       </aside>
 
-      {/* 메인 영역 */}
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
@@ -413,7 +420,7 @@ const App = () => {
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
               <div className="bg-slate-50 p-8 rounded-full mb-8"><FileSpreadsheet size={64} className="text-blue-200" /></div>
               <h3 className="text-2xl font-black text-slate-900 mb-2 italic">팀 워크스페이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하여 팀원들과 분석 데이터를 공유하세요.<br/>한 명만 올려도 모두가 함께 볼 수 있습니다.</p>
+              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하여 팀원들과 분석 데이터를 공유하세요.<br/>한 명만 올려도 모두의 화면에 실시간으로 보입니다.</p>
             </div>
           ) : (
             <>
@@ -612,11 +619,11 @@ const App = () => {
         </div>
       )}
 
-      {/* 화면 전체를 가리는 대신 화면 전환 없이 처리 표시를 띄우기 위한 스피너 (수정됨) */}
+      {/* 빠르고 깔끔한 상태 표시 스피너 */}
       {isProcessing && (
         <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-5 bg-white/90 backdrop-blur-2xl rounded-[28px] shadow-2xl border border-slate-100 flex items-center gap-4 z-[100] animate-in slide-in-from-bottom-8">
           <div className="w-5 h-5 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-          <span className="font-black text-slate-900 tracking-tighter italic">스마트 병합 엔진 가동 중...</span>
+          <span className="font-black text-slate-900 tracking-tighter italic">스마트 데이터 병합 중...</span>
         </div>
       )}
     </div>
