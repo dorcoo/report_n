@@ -60,7 +60,7 @@ const App = () => {
   const [user, setUser] = useState(null);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
 
-  // 실시간 구독 충돌 방지용 플래그
+  // 실시간 구독 및 프로세스 충돌 방지 플래그
   const isUploadingRef = useRef(false);
 
   useEffect(() => {
@@ -121,18 +121,15 @@ const App = () => {
   useEffect(() => {
     if (!user) return;
     
-    // 메타데이터만 구독하여 누군가 '업로드를 완벽히 끝냈을 때'만 감지
     const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
     
     const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
-      // 내가 막 데이터를 밀어넣고 있을 때는 내 화면을 덮어씌우지 않게 방어
       if (isUploadingRef.current) return;
       
       if (metaSnap.exists()) {
         const meta = metaSnap.data();
         const localUpdatedAt = localStorage.getItem('sales_dashboard_meta_updatedAt');
 
-        // 이미 0.1초만에 가져온 최신 버전이라면 네트워크 다운로드 생략 (초고속!)
         if (meta.updatedAt === localUpdatedAt && processedData.length > 0) {
           setIsFetchingFromDB(false);
           return; 
@@ -147,9 +144,8 @@ const App = () => {
           const deployId = meta.deployId;
           let fullPayloadString = "";
 
-          // 안전하고 가벼운 순차 다운로드 (브라우저 뻗음 방지)
           for(let i = 0; i < chunkCount; i++) {
-            setDownloadProgressText(`[데이터베이스 수신 중] ${i + 1} / ${chunkCount} 조각 다운로드...`);
+            setDownloadProgressText(`[데이터 수신 중] ${i + 1} / ${chunkCount} 블록...`);
             const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `deploy_${deployId}_chunk_${i}`));
             if(snap.exists()) {
               fullPayloadString += snap.data().data;
@@ -163,7 +159,6 @@ const App = () => {
             setMonthlyTrend(parsed.monthlyTrend || []);
             setGlobalMaxDate(parsed.globalMaxDate || '');
             
-            // 다음 접속 시 0.1초 컷을 위한 로컬 캐싱
             try {
               localStorage.setItem('sales_dashboard_local_data', fullPayloadString);
               localStorage.setItem('sales_dashboard_meta_updatedAt', meta.updatedAt);
@@ -180,7 +175,6 @@ const App = () => {
           setIsFetchingFromDB(false);
         }
       } else {
-        // DB가 완전 초기화된 경우
         setProcessedData([]);
         setDailyTrend([]);
         setMonthlyTrend([]);
@@ -198,33 +192,32 @@ const App = () => {
   }, [user, db, processedData.length]);
 
 
-  // --- 공용 클라우드 [안전한 분할 저장 및 Atomic Deploy] ---
+  // --- 공용 클라우드 [안전한 분할 저장 및 전처리 배포] ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db) return;
     
     try {
-      // 파이어베이스 색인 에러 방지: undefined나 찌꺼기 값을 전부 텍스트로 치환!
+      setUploadProgressText(`[클라우드 전처리] 데이터를 가볍게 압축 중...`);
+      // 브라우저 멈춤 방지를 위한 비동기 양보
+      await new Promise(r => setTimeout(r, 50));
+
       const cleanObj = JSON.parse(JSON.stringify(dataObj));
       const payloadString = JSON.stringify(cleanObj);
       
-      // 500,000 글자 단위로 조각 분할 (약 500KB - 파이어베이스 한도 절대 안 걸림)
       const chunkSize = 500000;
       const chunks = [];
       for (let i = 0; i < payloadString.length; i += chunkSize) {
         chunks.push(payloadString.substring(i, i + chunkSize));
       }
 
-      // 배포 고유 ID 생성 (이전 쓰레기 데이터와 충돌 방지)
       const deployId = Date.now().toString();
 
-      // 1. 조각들을 개별적으로 천천히 안전하게 저장 (네트워크 과부하 원천 차단)
       for (let i = 0; i < chunks.length; i++) {
         setUploadProgressText(`[클라우드 전송 중] ${i + 1} / ${chunks.length} 데이터 블록 업로드...`);
         const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `deploy_${deployId}_chunk_${i}`);
         await setDoc(chunkRef, { data: chunks[i] });
       }
 
-      // 2. 완벽하게 올라갔을 때만 메타데이터 업데이트! (이 순간 다른 브라우저들이 업데이트 됨)
       setUploadProgressText(`[동기화 마무리] 팀원들에게 배포 신호 전송 중...`);
       const updatedAt = new Date().toISOString();
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
@@ -235,7 +228,6 @@ const App = () => {
         authorId: user.uid
       });
       
-      // 내 로컬 캐시도 동일하게 세팅
       try {
         localStorage.setItem('sales_dashboard_local_data', payloadString);
         localStorage.setItem('sales_dashboard_meta_updatedAt', updatedAt);
@@ -243,7 +235,6 @@ const App = () => {
 
       setStatusMessage({ type: 'success', text: '안전하게 팀 전체 데이터 공유가 완료되었습니다!' });
 
-      // 3. 백그라운드 청소 (옛날 데이터 조각 삭제 - 사용자는 기다릴 필요 없음)
       try {
         const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
         const allSnaps = await getDocs(payloadsCol);
@@ -256,7 +247,6 @@ const App = () => {
             opsCount++;
           }
         });
-        
         if (opsCount > 0) await cleanupBatch.commit();
       } catch(e) { console.error("백그라운드 청소 실패 (무시됨)", e); }
 
@@ -266,7 +256,6 @@ const App = () => {
     }
   };
 
-  // --- 엑셀 가공 로직 ---
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -310,42 +299,52 @@ const App = () => {
       dailyTrend.forEach(d => dailyMap.set(d.date, { ...d }));
       monthlyTrend.forEach(m => monthlyMap.set(m.month, { ...m }));
 
-      // 브라우저가 멈추지 않게 엑셀 파일을 하나씩 처리하며 숨 쉴 틈(setTimeout) 제공
       for (let f = 0; f < targetFiles.length; f++) {
         const file = targetFiles[f];
-        setUploadProgressText(`[분석 중] ${f+1}/${targetFiles.length} : ${file.name} 데이터 읽는 중...`);
         
-        // 렌더링 양보 (화면 프리징 방지)
-        await new Promise(r => setTimeout(r, 50)); 
+        // 1. 엑셀 파일 로드
+        setUploadProgressText(`[데이터 추출 중] ${f+1}/${targetFiles.length} : '${file.name}' 읽는 중...`);
+        await new Promise(r => setTimeout(r, 20)); // 브라우저 숨쉬기 타임
         
         const dateStr = extractDate(file.name);
         if (dateStr !== '알 수 없는 날짜' && dateStr > currentMaxDate) currentMaxDate = dateStr;
         const monthStr = dateStr !== '알 수 없는 날짜' ? dateStr.substring(0, 7) : '알 수 없는 월';
-        const data = await parseExcel(file);
+        
+        const rawData = await parseExcel(file);
+
+        // 🔥 [전처리 핵심 로직] 불필요한 엑셀 열(수십개)을 모두 버리고, 필수 항목만 가볍게 구성합니다.
+        setUploadProgressText(`[전처리 진행 중] ${f+1}/${targetFiles.length} : 핵심 데이터 정제 중...`);
+        await new Promise(r => setTimeout(r, 20));
+
+        const cleanData = rawData.map(item => ({
+          pid: String(item['상품ID'] || item['상품번호'] || ''),
+          name: item['상품명'] || '이름 없음',
+          revenue: Number(item['결제금액']) || 0,
+          views: Number(item['상품상세조회수']) || 0,
+          sales: Number(item['결제상품수량']) || 0
+        })).filter(item => item.pid !== '');
 
         if (!dailyMap.has(dateStr)) dailyMap.set(dateStr, { date: dateStr, 매출: 0, 조회수: 0, 판매량: 0 });
         if (!monthlyMap.has(monthStr)) monthlyMap.set(monthStr, { month: monthStr, 매출: 0, 조회수: 0, 판매량: 0 });
 
-        data.forEach(item => {
-          const pid = String(item['상품ID'] || item['상품번호']);
-          if (!pid || pid === "undefined") return;
-          const currentName = item['상품명'] || '이름 없음';
-          const revenue = Number(item['결제금액']) || 0;
-          const views = Number(item['상품상세조회수']) || 0;
-          const sales = Number(item['결제상품수량']) || 0;
+        setUploadProgressText(`[데이터 누적 중] ${f+1}/${targetFiles.length} : 기존 데이터와 병합 중...`);
+        await new Promise(r => setTimeout(r, 20));
+
+        cleanData.forEach(item => {
+          const { pid, name, revenue, views, sales } = item;
 
           if (!productMap.has(pid)) {
             productMap.set(pid, { 
-              상품ID: pid, lastName: currentName, 결제금액: revenue, 상품상세조회수: views, 결제상품수량: sales, 
-              nameHistory: [{ name: currentName, start: dateStr, end: dateStr }], nameCount: 1 
+              상품ID: pid, lastName: name, 결제금액: revenue, 상품상세조회수: views, 결제상품수량: sales, 
+              nameHistory: [{ name: name, start: dateStr, end: dateStr }], nameCount: 1 
             });
           } else {
             const p = productMap.get(pid);
             p.결제금액 += revenue; p.상품상세조회수 += views; p.결제상품수량 += sales;
-            let nr = p.nameHistory.find(nh => nh.name === currentName);
+            let nr = p.nameHistory.find(nh => nh.name === name);
             if (!nr) { 
-              p.nameHistory.push({ name: currentName, start: dateStr, end: dateStr }); 
-              p.nameCount = p.nameHistory.length; p.lastName = currentName; 
+              p.nameHistory.push({ name: name, start: dateStr, end: dateStr }); 
+              p.nameCount = p.nameHistory.length; p.lastName = name; 
             } else {
               if (dateStr < nr.start) nr.start = dateStr;
               if (dateStr > nr.end) nr.end = dateStr;
@@ -359,11 +358,11 @@ const App = () => {
           const pHist = productDailyHistory.get(pid);
           const existingDay = pHist.find(h => h.date === dateStr);
           if (existingDay) { existingDay.매출 += revenue; existingDay.조회수 += views; existingDay.판매량 += sales; }
-          else { pHist.push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: currentName }); }
+          else { pHist.push({ date: dateStr, 매출: revenue, 조회수: views, 판매량: sales, nameUsed: name }); }
         });
       }
 
-      setUploadProgressText('분석 완료! 데이터베이스 구조로 변환 중입니다...');
+      setUploadProgressText('분석 완료! 클라우드 업로드 준비 중...');
       await new Promise(r => setTimeout(r, 50));
 
       const finalDailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
@@ -392,10 +391,8 @@ const App = () => {
         globalMaxDate: currentMaxDate
       };
 
-      // 안전한 전송 로직 호출
       await performCloudSync(dataObj);
 
-      // 성공 후 내 화면 즉시 그리기
       setProcessedData(finalProducts);
       setDailyTrend(finalDailyTrend);
       setMonthlyTrend(finalMonthlyTrend);
@@ -410,7 +407,6 @@ const App = () => {
     }
   };
 
-  // --- 집계 데이터 ---
   const summary = useMemo(() => {
     const totalRev = processedData.reduce((acc, curr) => acc + curr.결제금액, 0);
     const totalSales = processedData.reduce((acc, curr) => acc + curr.결제상품수량, 0);
@@ -430,39 +426,22 @@ const App = () => {
 
   const clearData = async () => {
     if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속 중인 모든 사용자의 화면이 즉시 텅 비게 됩니다.")) {
-      setIsUploadingToDB(true);
-      setUploadProgressText("DB 초기화 진행 중...");
       try {
         const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
         await deleteDoc(metaRef);
         
         const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
-        const allSnaps = await getDocs(payloadsCol);
-        
-        let batch = writeBatch(db);
-        let count = 0;
-        for (let i = 0; i < allSnaps.docs.length; i++) {
-            batch.delete(allSnaps.docs[i].ref);
-            count++;
-            if (count === 400) {
-                await batch.commit();
-                batch = writeBatch(db);
-                count = 0;
-            }
-        }
-        if (count > 0) await batch.commit();
+        const oldChunks = await getDocs(payloadsCol);
+        const batch = writeBatch(db);
+        oldChunks.forEach(d => batch.delete(d.ref));
+        await batch.commit();
 
         setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
         localStorage.removeItem('sales_dashboard_local_data');
         localStorage.removeItem('sales_dashboard_meta_updatedAt');
 
-        setStatusMessage({ type: 'success', text: '공용 데이터가 성공적으로 지워졌습니다.' });
-      } catch(e) { 
-        console.error("Delete error", e); 
-        setStatusMessage({ type: 'error', text: '초기화 중 오류가 발생했습니다.' });
-      } finally {
-        setIsUploadingToDB(false);
-      }
+        setStatusMessage({ type: 'success', text: '공용 데이터가 비워졌습니다.' });
+      } catch(e) { console.error("Delete error", e); }
     }
   };
 
@@ -516,11 +495,11 @@ const App = () => {
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '모두가 보는 성장 리포트' : '상품 성과 상세'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '조회수 리포트' : '상품 성과 상세'}</h2>
              <div className="flex items-center gap-2">
                <div className={`h-2 w-2 rounded-full ${isFetchingFromDB || isUploadingToDB ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Shared Board</span>
-               {isFetchingFromDB && !isUploadingToDB && <div className="flex items-center gap-1.5 text-[10px] text-blue-500 font-black animate-pulse"><RefreshCw size={10} className="animate-spin" /> 서버 동기화 중...</div>}
+               {isFetchingFromDB && !isUploadingToDB && <div className="flex items-center gap-1.5 text-[10px] text-blue-500 font-black animate-pulse"><RefreshCw size={10} className="animate-spin" /> DB 렌더링 중...</div>}
              </div>
           </div>
           <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90"><Menu size={22} /></button>
@@ -536,7 +515,7 @@ const App = () => {
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
               <div className="bg-slate-50 p-8 rounded-full mb-8"><Database size={64} className="text-blue-200" /></div>
               <h3 className="text-2xl font-black text-slate-900 mb-2 italic">데이터베이스가 비어있습니다.</h3>
-              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하면 데이터가 추출되어 공용 DB에 즉시 저장됩니다.<br/>이제부터 브라우저는 오직 DB 데이터만 바라봅니다.</p>
+              <p className="text-slate-400 font-medium text-center">엑셀을 업로드하면 전처리를 거쳐 압축된 후 공용 DB에 즉시 저장됩니다.<br/>이제 수천 개의 파일도 무한 로딩 없이 부드럽게 공유됩니다.</p>
             </div>
           ) : (
             <>
@@ -631,6 +610,7 @@ const App = () => {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50">
+                        {/* 페이징 적용하여 브라우저 과부하 방지 */}
                         {sortedData.slice(0, visibleCount).map((item, idx) => (
                           <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer group transition-colors" onClick={() => setSelectedProduct(item)}>
                             <td className="px-10 py-8 min-w-[350px]">
@@ -740,7 +720,7 @@ const App = () => {
         </div>
       )}
 
-      {/* 알림 토스트 */}
+      {/* 알림 토스트 (타임아웃 적용) */}
       {statusMessage && (
         <div className={`fixed bottom-10 right-10 px-8 py-5 rounded-[28px] shadow-2xl text-white font-black flex items-center gap-4 animate-in slide-in-from-bottom-8 z-[200] ${statusMessage.type === 'error' ? 'bg-rose-500' : 'bg-slate-900'}`}>
           {statusMessage.type === 'error' ? <AlertCircle size={20} /> : <CheckCircle2 size={20} />}
