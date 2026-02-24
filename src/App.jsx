@@ -60,11 +60,7 @@ const App = () => {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
 
   // 실시간 구독 충돌 방지를 위한 Ref
-  const isProcessingRef = useRef(false);
   const isSyncingRef = useRef(false);
-
-  const setProcessingState = (val) => { setIsProcessing(val); isProcessingRef.current = val; };
-  const setSyncingState = (val) => { setIsSyncing(val); isSyncingRef.current = val; };
 
   // 1. 외부 라이브러리 안전 로드
   useEffect(() => {
@@ -107,7 +103,7 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 3. 진정한 '공용 데이터베이스' 실시간 동기화 (로컬 캐시 배제)
+  // 3. 진정한 '공용 데이터베이스' 실시간 동기화 (초고속 병렬 다운로드)
   useEffect(() => {
     if (!user) return;
     
@@ -115,8 +111,8 @@ const App = () => {
     const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
     
     const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
-      // 내가 데이터를 올리고 있거나 파싱 중일 때는 화면 덮어쓰기 방지
-      if (isProcessingRef.current || isSyncingRef.current) return;
+      // 내가 막 데이터를 서버로 올리고 있는 순간에는 다른 사람의 덮어쓰기 방지
+      if (isSyncingRef.current) return;
       
       if (metaSnap.exists() && window.LZString) {
         setIsInitialLoading(true);
@@ -124,6 +120,7 @@ const App = () => {
           const meta = metaSnap.data();
           const chunkCount = meta.chunkCount || 0;
           
+          // Promise.all을 활용한 병렬 초고속 다운로드
           let chunkPromises = [];
           for (let i = 0; i < chunkCount; i++) {
             chunkPromises.push(getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`)));
@@ -140,14 +137,14 @@ const App = () => {
             setMonthlyTrend(parsed.monthlyTrend || []);
             setGlobalMaxDate(parsed.globalMaxDate || '');
             
-            // 데이터가 비어있지 않을 때만 성공 알림
-            if (parsed.processedData?.length > 0) {
-              setStatusMessage({ type: 'success', text: '팀 워크스페이스의 최신 데이터를 불러왔습니다.' });
+            // 다른 사람이 업데이트한 데이터를 받았을 때만 알림
+            if (meta.authorId !== user.uid && parsed.processedData?.length > 0) {
+              setStatusMessage({ type: 'success', text: '팀원이 업데이트한 최신 데이터를 불러왔습니다.' });
             }
           }
         } catch(e) {
           console.error("Cloud fetch error:", e);
-          setStatusMessage({ type: 'error', text: '데이터 동기화에 실패했습니다.' });
+          setStatusMessage({ type: 'error', text: '데이터 동기화 중 오류가 발생했습니다.' });
         } finally {
           setIsInitialLoading(false);
         }
@@ -164,48 +161,54 @@ const App = () => {
     return () => unsubscribe();
   }, [user, db]);
 
-  // --- 공용 클라우드 분할 저장 로직 (1MB 돌파의 핵심) ---
+  // --- 공용 클라우드 [Batch 일괄 저장] 로직 (속도 및 안정성 핵심) ---
   const performCloudSync = async (dataObj) => {
     if (!user || !db || !window.LZString) return;
     
-    setSyncingState(true);
-    setStatusMessage({ type: 'info', text: '데이터를 분할하여 팀원들에게 배포하고 있습니다...' });
+    setIsSyncing(true);
+    isSyncingRef.current = true;
     
     try {
       const payloadString = JSON.stringify(dataObj);
       const compressedPayload = window.LZString.compressToUTF16(payloadString);
       
-      // [핵심 변경] Firestore 1MB 제한을 확실하게 피하기 위해 약 500KB(25만자) 단위로 더 잘게 쪼갬
-      const chunkSize = 250000; 
+      // 약 400KB 단위로 쪼개기 (안정성을 위해 크기 조절)
+      const chunkSize = 400000; 
       const chunks = [];
       for (let i = 0; i < compressedPayload.length; i += chunkSize) {
         chunks.push(compressedPayload.substring(i, i + chunkSize));
       }
 
-      // 1. 공용 공간에 순차적으로 조각 저장 (네트워크 안정성 확보)
+      // [핵심 변경] writeBatch를 사용하여 모든 조각과 메타데이터를 단 1번의 통신으로 한 번에 서버에 기록합니다!
+      const batch = writeBatch(db);
+
       for (let i = 0; i < chunks.length; i++) {
-        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`), { data: chunks[i] });
+        const chunkRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`);
+        batch.set(chunkRef, { data: chunks[i] });
       }
 
-      // 2. 메타데이터 최종 업데이트 (이 순간 다른 팀원들의 화면이 일제히 업데이트 됨)
       const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
-      await setDoc(metaRef, {
+      batch.set(metaRef, {
         chunkCount: chunks.length,
         updatedAt: new Date().toISOString(),
         originalSize: payloadString.length,
         authorId: user.uid
       });
       
-      setStatusMessage({ type: 'success', text: '모든 사람의 대시보드에 최신 데이터가 반영되었습니다!' });
+      // 모든 데이터 일괄 전송 (속도 극대화, 누락 방지)
+      await batch.commit();
+      
+      setStatusMessage({ type: 'success', text: '팀 전체에 최신 데이터가 성공적으로 배포되었습니다!' });
     } catch (err) { 
       console.error("Sync error:", err);
-      setStatusMessage({ type: 'error', text: '클라우드 저장 실패: 용량이 너무 크거나 인터넷 연결이 불안정합니다.' });
+      setStatusMessage({ type: 'error', text: '클라우드 공유 실패: 데이터가 너무 크거나 오프라인 상태입니다.' });
     } finally { 
-      setSyncingState(false); 
+      setIsSyncing(false); 
+      isSyncingRef.current = false;
     }
   };
 
-  // --- 엑셀 가공 로직 (누적 병합) ---
+  // --- 엑셀 가공 로직 ---
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -231,7 +234,7 @@ const App = () => {
 
   const processFiles = async (targetFiles) => {
     if (!isLibLoaded) return;
-    setProcessingState(true);
+    setIsProcessing(true);
     
     const productMap = new Map();
     const dailyMap = new Map();
@@ -310,20 +313,20 @@ const App = () => {
         return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
       });
 
-      // UI 업데이트 후 파일 읽기 종료
+      // 1단계: 분석 완료 즉시 UI 최신화
       setProcessedData(finalProducts);
       setDailyTrend(finalDailyTrend);
       setMonthlyTrend(finalMonthlyTrend);
       setGlobalMaxDate(currentMaxDate);
-      setProcessingState(false);
+      setIsProcessing(false);
 
-      // 브라우저 백그라운드에서 동기화 수행
+      // 2단계: 백그라운드 공용 클라우드에 '초고속 Batch 전송'
       performCloudSync({ processedData: finalProducts, dailyTrend: finalDailyTrend, monthlyTrend: finalMonthlyTrend, globalMaxDate: currentMaxDate });
       
     } catch (err) { 
       console.error(err);
-      setProcessingState(false);
-      setStatusMessage({ type: 'error', text: '데이터 가공 중 오류가 발생했습니다.' }); 
+      setIsProcessing(false);
+      setStatusMessage({ type: 'error', text: '데이터 파싱 중 오류가 발생했습니다.' }); 
     }
   };
 
@@ -346,18 +349,26 @@ const App = () => {
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
   const clearData = async () => {
-    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속한 모든 사용자의 화면에서도 실시간으로 데이터가 지워집니다.")) {
+    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n모든 사용자의 화면에서도 삭제됩니다.")) {
       setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
       
       try {
         const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
         await deleteDoc(metaRef);
-        setStatusMessage({ type: 'success', text: '공용 데이터가 완전히 초기화되었습니다.' });
+        setStatusMessage({ type: 'success', text: '공용 데이터가 비워졌습니다.' });
       } catch(e) {
         console.error("Delete error", e);
       }
     }
   };
+
+  // 알림 토스트 자동 닫기 처리
+  useEffect(() => {
+    if (statusMessage) {
+      const timer = setTimeout(() => setStatusMessage(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [statusMessage]);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans">
@@ -380,7 +391,7 @@ const App = () => {
           <div className="relative bg-slate-50 p-5 rounded-[24px] border border-slate-100 flex flex-col items-center gap-3 hover:bg-blue-50 hover:border-blue-100 transition-all cursor-pointer group shadow-sm overflow-hidden">
             <input type="file" multiple accept=".xlsx" onChange={(e) => processFiles(Array.from(e.target.files))} className="absolute inset-0 opacity-0 cursor-pointer z-10" title="엑셀 파일 추가" />
             <div className="bg-white p-2.5 rounded-xl shadow-md group-hover:scale-110 transition-transform"><Upload size={22} className="text-blue-600" /></div>
-            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600">공용 데이터 합치기</span>}
+            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600">공용 데이터 병합하기</span>}
           </div>
           {!isSidebarCollapsed && (
             <div className="px-3 py-3 bg-blue-50/50 border border-blue-100 rounded-xl flex items-center gap-3 shadow-inner">
@@ -610,20 +621,20 @@ const App = () => {
         </div>
       )}
 
-      {/* 알림 토스트 */}
+      {/* 알림 토스트 (타임아웃 적용) */}
       {statusMessage && (
         <div className={`fixed bottom-10 right-10 px-8 py-5 rounded-[28px] shadow-2xl text-white font-black flex items-center gap-4 animate-in slide-in-from-bottom-8 z-[200] ${statusMessage.type === 'error' ? 'bg-rose-500' : 'bg-slate-900'}`}>
           {statusMessage.type === 'error' ? <AlertCircle size={20} /> : <CheckCircle2 size={20} />}
           <span className="tracking-tight leading-none">{statusMessage.text}</span>
-          <button onClick={() => setStatusMessage(null)} className="ml-4 opacity-50"><X size={18} /></button>
+          <button onClick={() => setStatusMessage(null)} className="ml-4 opacity-50 hover:opacity-100"><X size={18} /></button>
         </div>
       )}
 
-      {/* 빠르고 깔끔한 상태 표시 스피너 */}
+      {/* 업로드 중 UI 피드백 */}
       {isProcessing && (
         <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-5 bg-white/90 backdrop-blur-2xl rounded-[28px] shadow-2xl border border-slate-100 flex items-center gap-4 z-[100] animate-in slide-in-from-bottom-8">
           <div className="w-5 h-5 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-          <span className="font-black text-slate-900 tracking-tighter italic">스마트 데이터 병합 중...</span>
+          <span className="font-black text-slate-900 tracking-tighter italic">데이터를 분석하고 있습니다...</span>
         </div>
       )}
     </div>
