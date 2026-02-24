@@ -16,7 +16,7 @@ import {
  * Render에서 받은 실제 주소로 꼭 바꿔주세요!
  * 예: const SERVER_URL = 'https://report-backend-xxxx.onrender.com';
  */
-const SERVER_URL = 'http://localhost:8080';
+const SERVER_URL = 'https://report-backend-0fwr.onrender.com';
 
 const App = () => {
   // --- 데이터 상태 ---
@@ -478,3 +478,4 @@ const App = () => {
 };
 
 export default App;
+
