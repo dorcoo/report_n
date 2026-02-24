@@ -3,7 +3,7 @@ import {
   Upload, Download, BarChart3, TrendingUp, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
   FileSpreadsheet, Calendar, ChevronRight, ChevronLeft, X, LayoutDashboard, 
-  History, Info, ArrowUpRight, ArrowDownRight, Minus, Filter, Sparkles, Menu, MousePointer2, Save, Cloud, RefreshCw, DollarSign, TrendingDown
+  History, Info, ArrowUpRight, ArrowDownRight, Minus, Filter, Sparkles, Menu, MousePointer2, Save, Cloud, RefreshCw, DollarSign, Users
 } from 'lucide-react';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, 
@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, collection, getDocs, writeBatch } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, collection, getDocs, writeBatch, onSnapshot, deleteDoc } from 'firebase/firestore';
 
 // 외부 라이브러리
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
@@ -20,15 +20,16 @@ const COMPRESS_LIB_URL = "https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0
 /**
  * Firebase 설정
  */
-const firebaseConfig = {
-  apiKey: "AIzaSyACry7jGKyGz5sEQuEXxUINRwlC585892g",
-  authDomain: "sales-dashboard-7e937.firebaseapp.com",
-  projectId: "sales-dashboard-7e937",
-  storageBucket: "sales-dashboard-7e937.firebasestorage.app",
-  messagingSenderId: "738450479038",
-  appId: "1:738450479038:web:c1d9fa9b8a9f0da386cbef",
-  measurementId: "G-9064EQMDNB"
-};
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+  ? JSON.parse(__firebase_config) 
+  : {
+      apiKey: "AIzaSyACry7jGKyGz5sEQuEXxUINRwlC585892g",
+      authDomain: "sales-dashboard-7e937.firebaseapp.com",
+      projectId: "sales-dashboard-7e937",
+      storageBucket: "sales-dashboard-7e937.firebasestorage.app",
+      messagingSenderId: "738450479038",
+      appId: "1:738450479038:web:c1d9fa9b8a9f0da386cbef",
+    };
 
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'sales-dashboard-app';
 const app = initializeApp(firebaseConfig);
@@ -36,35 +37,30 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 
 const App = () => {
+  // --- 데이터 상태 ---
   const [processedData, setProcessedData] = useState([]);
   const [dailyTrend, setDailyTrend] = useState([]);
   const [monthlyTrend, setMonthlyTrend] = useState([]);
+  const [globalMaxDate, setGlobalMaxDate] = useState('');
+  
+  // --- UI 상태 ---
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [activeTab, setActiveTab] = useState('dashboard');
   const [searchTerm, setSearchTerm] = useState('');
   const [showOnlyNameChanged, setShowOnlyNameChanged] = useState(false);
   const [sortConfig, setSortConfig] = useState({ key: '상품상세조회수', direction: 'desc' });
-  const [statusMessage, setStatusMessage] = useState(null);
-  const [isLibLoaded, setIsLibLoaded] = useState(false);
-  const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [globalMaxDate, setGlobalMaxDate] = useState('');
+  const [statusMessage, setStatusMessage] = useState(null);
+  
+  // --- 인프라 상태 ---
   const [user, setUser] = useState(null);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isLibLoaded, setIsLibLoaded] = useState(false);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
 
-  // 라이브러리 및 로컬 데이터 로딩
+  // 1. 외부 라이브러리 로드
   useEffect(() => {
-    const savedLocal = localStorage.getItem('sales_dashboard_local_data');
-    if (savedLocal) {
-      try {
-        const parsed = JSON.parse(savedLocal);
-        setProcessedData(parsed.processedData || []);
-        setDailyTrend(parsed.dailyTrend || []);
-        setMonthlyTrend(parsed.monthlyTrend || []);
-        setGlobalMaxDate(parsed.globalMaxDate || '');
-      } catch (e) { console.error("로컬 복구 실패", e); }
-    }
-
     const loadScripts = async () => {
       const scripts = [EXCEL_LIB_URL, COMPRESS_LIB_URL];
       for (const src of scripts) {
@@ -82,7 +78,7 @@ const App = () => {
     loadScripts();
   }, []);
 
-  // Firebase 인증
+  // 2. 인증 관리
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -91,32 +87,39 @@ const App = () => {
         } else {
           await signInAnonymously(auth);
         }
-      } catch (error) { console.error("인증 오류", error); }
+      } catch (error) { console.error("Auth error", error); }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => { setUser(currentUser); });
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      if (!currentUser) setIsInitialLoading(false);
+    });
     return () => unsubscribe();
   }, []);
 
-  // 클라우드 데이터 로드 (분할 병합)
+  // 3. 공용 데이터베이스 실시간 구독 (Real-time Sync)
   useEffect(() => {
-    if (!user || processedData.length > 0) return;
+    if (!user) return;
     
-    const loadFromCloud = async () => {
-      try {
-        const metaRef = doc(db, 'artifacts', appId, 'users', user.uid, 'reports', 'metadata');
-        const metaSnap = await getDoc(metaRef);
-        
-        if (metaSnap.exists() && window.LZString) {
+    // 모두가 공유하는 Public 경로
+    const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
+    
+    const unsubscribe = onSnapshot(metaRef, async (metaSnap) => {
+      // 내가 데이터를 올리거나 처리 중일 때는 덮어쓰기 방지
+      if (isProcessing || isSyncing) return;
+      
+      if (metaSnap.exists() && window.LZString) {
+        setIsInitialLoading(true);
+        try {
           const meta = metaSnap.data();
           const chunkCount = meta.chunkCount || 0;
           
-          let chunks = [];
+          let chunkPromises = [];
           for (let i = 0; i < chunkCount; i++) {
-            chunks.push(getDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'payloads', `chunk_${i}`)));
+            chunkPromises.push(getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`)));
           }
           
-          const snaps = await Promise.all(chunks);
+          const snaps = await Promise.all(chunkPromises);
           const fullPayload = snaps.map(s => s.exists() ? s.data().data : "").join("");
           
           const decompressed = window.LZString.decompressFromUTF16(fullPayload);
@@ -126,14 +129,31 @@ const App = () => {
             setDailyTrend(parsed.dailyTrend || []);
             setMonthlyTrend(parsed.monthlyTrend || []);
             setGlobalMaxDate(parsed.globalMaxDate || '');
+            
+            // 데이터가 새로 들어왔을 때만 메시지 띄우기
+            if (parsed.processedData?.length > 0) {
+              setStatusMessage({ type: 'success', text: '공용 데이터베이스가 동기화되었습니다.' });
+            }
           }
+        } catch(e) {
+          console.error("Cloud fetch error", e);
+        } finally {
+          setIsInitialLoading(false);
         }
-      } catch (e) { console.error("클라우드 로드 실패", e); }
-    };
-    loadFromCloud();
-  }, [user, processedData.length]);
+      } else if (!metaSnap.exists()) {
+        // DB가 비워졌을 때
+        setProcessedData([]);
+        setIsInitialLoading(false);
+      }
+    }, (error) => {
+      console.error("Snapshot error:", error);
+      setIsInitialLoading(false);
+    });
 
-  // 클라우드 저장 (최적화 버전)
+    return () => unsubscribe();
+  }, [user, isProcessing, isSyncing]);
+
+  // 공용 클라우드에 분할 저장 (1MB 한계 극복)
   const performCloudSync = async (dataObj) => {
     if (!user || !db || !window.LZString) return;
     setIsSyncing(true);
@@ -141,34 +161,36 @@ const App = () => {
       const payloadString = JSON.stringify(dataObj);
       const compressedPayload = window.LZString.compressToUTF16(payloadString);
       
+      // 800KB 단위 분할
       const chunkSize = 800000; 
       const chunks = [];
       for (let i = 0; i < compressedPayload.length; i += chunkSize) {
         chunks.push(compressedPayload.substring(i, i + chunkSize));
       }
 
-      // 병렬 저장을 통한 속도 향상
-      const chunkPromises = chunks.map((chunkData, i) => {
-        return setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'payloads', `chunk_${i}`), { data: chunkData });
-      });
-      
-      await Promise.all(chunkPromises);
+      // 1. 공용 공간에 순차적 청크 저장
+      for (let i = 0; i < chunks.length; i++) {
+        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shared_payloads', `chunk_${i}`), { data: chunks[i] });
+      }
 
-      const metaRef = doc(db, 'artifacts', appId, 'users', user.uid, 'reports', 'metadata');
+      // 2. 메타데이터 업데이트 (이때 다른 접속자들의 onSnapshot이 트리거됨)
+      const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
       await setDoc(metaRef, {
         chunkCount: chunks.length,
         updatedAt: new Date().toISOString(),
-        originalSize: payloadString.length
+        originalSize: payloadString.length,
+        authorId: user.uid // 마지막 업데이트한 사람 추적용
       });
       
-      localStorage.setItem('sales_dashboard_local_data', payloadString);
     } catch (err) { 
-      console.error("클라우드 동기화 실패", err);
+      console.error("Sync error", err);
+      setStatusMessage({ type: 'error', text: '클라우드 저장 실패: 권한 또는 용량 문제를 확인하세요.' });
     } finally { 
       setIsSyncing(false); 
     }
   };
 
+  // --- 엑셀 가공 로직 (누적 병합) ---
   const extractDate = (fileName) => {
     const matches = fileName.match(/\d{4}-\d{1,2}-\d{1,2}/g);
     if (!matches) return '알 수 없는 날짜';
@@ -196,13 +218,13 @@ const App = () => {
     if (!isLibLoaded) return;
     setIsProcessing(true);
     
-    // 빠른 처리를 위한 Map 구조
     const productMap = new Map();
     const dailyMap = new Map();
     const monthlyMap = new Map();
     const productDailyHistory = new Map();
     let currentMaxDate = globalMaxDate;
 
+    // 공용 DB에 있던 기존 데이터를 바탕으로 맵 생성
     processedData.forEach(p => {
       productMap.set(p.상품ID, { ...p });
       productDailyHistory.set(p.상품ID, [...(p.history || [])]);
@@ -273,24 +295,25 @@ const App = () => {
         return { ...p, 상세조회대비결제율: p.상품상세조회수 > 0 ? p.결제상품수량 / p.상품상세조회수 : 0, history, performanceByName };
       });
 
-      // UI 업데이트를 먼저 수행 (스피너 제거)
+      // 1단계: 분석 완료 즉시 UI 갱신 (빠른 반응성)
       setProcessedData(finalProducts);
       setDailyTrend(finalDailyTrend);
       setMonthlyTrend(finalMonthlyTrend);
       setGlobalMaxDate(currentMaxDate);
       setIsProcessing(false);
-      setStatusMessage({ type: 'success', text: `데이터 분석 완료! 클라우드 동기화를 시작합니다.` });
+      setStatusMessage({ type: 'success', text: `데이터 병합 완료! 모두에게 업데이트를 배포합니다.` });
 
-      // 백그라운드에서 동기화 수행
+      // 2단계: 백그라운드 공용 클라우드에 저장
       performCloudSync({ processedData: finalProducts, dailyTrend: finalDailyTrend, monthlyTrend: finalMonthlyTrend, globalMaxDate: currentMaxDate });
       
     } catch (err) { 
       console.error(err);
       setIsProcessing(false);
-      setStatusMessage({ type: 'error', text: '데이터 처리 중 오류가 발생했습니다.' }); 
+      setStatusMessage({ type: 'error', text: '데이터 가공 중 오류가 발생했습니다.' }); 
     }
   };
 
+  // --- 집계 데이터 ---
   const summary = useMemo(() => {
     const totalRev = processedData.reduce((acc, curr) => acc + curr.결제금액, 0);
     const totalSales = processedData.reduce((acc, curr) => acc + curr.결제상품수량, 0);
@@ -308,53 +331,93 @@ const App = () => {
 
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
+  const clearData = async () => {
+    if (window.confirm("공용 데이터베이스의 모든 데이터를 초기화하시겠습니까?\n접속한 모든 사용자의 화면에서도 데이터가 지워집니다.")) {
+      setProcessedData([]); setDailyTrend([]); setMonthlyTrend([]); setGlobalMaxDate('');
+      
+      // 메타데이터 삭제 (다른 클라이언트들에게 비워짐 알림)
+      const metaRef = doc(db, 'artifacts', appId, 'public', 'data', 'shared_reports', 'metadata');
+      await deleteDoc(metaRef);
+
+      // 청크 삭제 (백그라운드 처리)
+      const payloadsCol = collection(db, 'artifacts', appId, 'public', 'data', 'shared_payloads');
+      const existingChunks = await getDocs(payloadsCol);
+      const batch = writeBatch(db);
+      existingChunks.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+
+      setStatusMessage({ type: 'success', text: '공용 데이터가 완전히 초기화되었습니다.' });
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans selection:bg-indigo-100">
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans">
+      {/* 사이드바 */}
       <aside className={`fixed left-0 top-0 h-full bg-white border-r border-slate-200 z-30 flex flex-col transition-all duration-300 ${isSidebarCollapsed ? 'w-20' : 'w-64'}`}>
         <div className="p-6 flex items-center gap-3 border-b border-slate-50">
-          <div className="bg-indigo-600 p-2 rounded-xl text-white shadow-xl shrink-0"><Sparkles size={20} /></div>
-          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900">판매분석 <span className="text-indigo-600 font-bold text-sm ml-1">MAX</span></h1>}
+          <div className="bg-blue-600 p-2 rounded-xl text-white shadow-xl shrink-0 transition-transform active:scale-95"><Users size={20} /></div>
+          {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900">판매분석 <span className="text-blue-600 font-bold text-sm ml-1 uppercase italic">TEAM</span></h1>}
         </div>
         
         <nav className="flex-1 px-4 py-6 space-y-2">
-          <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'dashboard' ? 'bg-indigo-50 text-indigo-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
-            <LayoutDashboard size={20} /> {!isSidebarCollapsed && <span>대시보드 요약</span>}
+          <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'dashboard' ? 'bg-blue-50 text-blue-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
+            <LayoutDashboard size={20} /> {!isSidebarCollapsed && <span>공용 성장 리포트</span>}
           </button>
-          <button onClick={() => setActiveTab('products')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'products' ? 'bg-indigo-50 text-indigo-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
-            <ShoppingCart size={20} /> {!isSidebarCollapsed && <span>상품별 심층분석</span>}
+          <button onClick={() => setActiveTab('products')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'products' ? 'bg-blue-50 text-blue-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
+            <ShoppingCart size={20} /> {!isSidebarCollapsed && <span>상품별 분석</span>}
           </button>
         </nav>
 
-        <div className="p-4 space-y-3">
-          <div className="relative bg-slate-50 p-5 rounded-[24px] border border-slate-100 flex flex-col items-center gap-3 hover:bg-indigo-50 transition-all cursor-pointer group">
-            <input type="file" multiple accept=".xlsx" onChange={(e) => processFiles(Array.from(e.target.files))} className="absolute inset-0 opacity-0 cursor-pointer z-10" />
-            <div className="bg-white p-2.5 rounded-xl shadow-md group-hover:scale-110 transition-transform"><Upload size={22} className="text-indigo-600" /></div>
-            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600">엑셀 데이터 추가</span>}
+        <div className="p-4 space-y-3 border-t border-slate-50">
+          <div className="relative bg-slate-50 p-5 rounded-[24px] border border-slate-100 flex flex-col items-center gap-3 hover:bg-blue-50 hover:border-blue-100 transition-all cursor-pointer group shadow-sm overflow-hidden">
+            <input type="file" multiple accept=".xlsx" onChange={(e) => processFiles(Array.from(e.target.files))} className="absolute inset-0 opacity-0 cursor-pointer z-10" title="엑셀 파일 추가" />
+            <div className="bg-white p-2.5 rounded-xl shadow-md group-hover:scale-110 transition-transform"><Upload size={22} className="text-blue-600" /></div>
+            {!isSidebarCollapsed && <span className="text-xs font-black text-slate-600">공용 데이터 합치기</span>}
           </div>
+          {!isSidebarCollapsed && (
+            <div className="px-3 py-3 bg-blue-50/50 border border-blue-100 rounded-xl flex items-center gap-3 shadow-inner">
+               <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shrink-0"><Cloud size={14} /></div>
+               <div className="min-w-0">
+                  <p className="text-[9px] font-black text-blue-500 uppercase tracking-widest leading-none mb-1">Public Workspace</p>
+                  <p className="text-[10px] text-blue-700 font-bold truncate">공용 DB 연결 완료</p>
+               </div>
+            </div>
+          )}
+          {processedData.length > 0 && !isSidebarCollapsed && (
+            <button onClick={clearData} className="w-full flex items-center justify-center gap-2 p-3 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl text-xs font-bold transition-all underline underline-offset-4">모두의 데이터 지우기</button>
+          )}
         </div>
       </aside>
 
+      {/* 메인 영역 */}
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100">
           <div className="flex items-center gap-4">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight">{activeTab === 'dashboard' ? '종합 성장 리포트' : '상품 상세 성과'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none">{activeTab === 'dashboard' ? '모두가 보는 성장 리포트' : '상품 성과 상세'}</h2>
              <div className="flex items-center gap-2">
-               <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-               {isSyncing && <div className="flex items-center gap-1 text-[10px] text-indigo-500 font-bold animate-pulse"><RefreshCw size={10} className="animate-spin" /> 클라우드 실시간 동기화 중...</div>}
+               <div className={`h-2 w-2 rounded-full ${isSyncing ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
+               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest">Shared Board</span>
+               {isSyncing && <div className="flex items-center gap-1.5 text-[10px] text-blue-500 font-black animate-pulse"><RefreshCw size={10} className="animate-spin" /> 팀 전체에 배포 중...</div>}
              </div>
           </div>
-          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2 hover:bg-slate-50 rounded-lg transition-colors text-slate-400"><Menu size={20} /></button>
+          <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90"><Menu size={22} /></button>
         </header>
 
-        <div className="p-10 max-w-[1400px] mx-auto space-y-10">
-          {processedData.length === 0 ? (
+        <div className="p-10 max-w-[1500px] mx-auto space-y-10">
+          {isInitialLoading ? (
+            <div className="h-[60vh] flex flex-col items-center justify-center">
+              <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+              <p className="font-black text-slate-400 tracking-widest uppercase text-xs">공용 데이터베이스 불러오는 중...</p>
+            </div>
+          ) : processedData.length === 0 ? (
             <div className="h-[70vh] flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-200 rounded-[56px] bg-white shadow-2xl">
-              <div className="bg-slate-50 p-8 rounded-full mb-8 animate-bounce"><FileSpreadsheet size={64} className="text-indigo-200" /></div>
-              <h3 className="text-2xl font-black text-slate-900 mb-2">분석할 데이터가 없습니다</h3>
-              <p className="text-slate-400 font-medium">엑셀 파일을 업로드하면 50MB 대용량 모드로 분석이 시작됩니다.</p>
+              <div className="bg-slate-50 p-8 rounded-full mb-8"><FileSpreadsheet size={64} className="text-blue-200" /></div>
+              <h3 className="text-2xl font-black text-slate-900 mb-2 italic">팀 워크스페이스가 비어있습니다.</h3>
+              <p className="text-slate-400 font-medium text-center">엑셀 파일을 업로드하여 팀원들과 분석 데이터를 공유하세요.<br/>한 명만 올려도 모두가 함께 볼 수 있습니다.</p>
             </div>
           ) : (
             <>
+              {/* 핵심 요약 */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
                 {[
                   { label: '누적 매출액', val: `₩${summary.revenue.toLocaleString()}`, color: 'indigo', icon: TrendingUp },
@@ -362,11 +425,12 @@ const App = () => {
                   { label: '일평균 유입', val: `${summary.dailyAvgViews.toFixed(0)}회`, color: 'sky', icon: MousePointer2 },
                   { label: '평균 결제 전환율', val: `${summary.conversionRate.toFixed(2)}%`, color: 'rose', icon: CheckCircle2 }
                 ].map((s, i) => (
-                  <div key={i} className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-xl shadow-slate-200/40 hover:translate-y-[-4px] transition-all">
+                  <div key={i} className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-xl shadow-slate-200/40 hover:translate-y-[-4px] transition-all group">
                     <div className="flex justify-between items-start mb-6">
-                      <div className={`p-4 rounded-3xl bg-${s.color}-50 text-${s.color}-600`}><s.icon size={24} /></div>
+                      <div className={`p-4 rounded-3xl bg-${s.color}-50 text-${s.color}-600 group-hover:bg-blue-600 group-hover:text-white transition-colors`}><s.icon size={24} /></div>
+                      <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Report</span>
                     </div>
-                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">{s.label}</p>
+                    <p className="text-[11px] font-black text-slate-400 uppercase tracking-widest mb-1">{s.label}</p>
                     <h4 className="text-3xl font-black text-slate-900 tracking-tighter">{s.val}</h4>
                   </div>
                 ))}
@@ -381,7 +445,7 @@ const App = () => {
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart data={monthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
-                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 600}} dy={10} />
+                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 800}} dy={10} />
                             <YAxis hide />
                             <Tooltip cursor={{fill: '#F8FAFC', radius: 12}} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} />
                             <Bar name="매출액" dataKey="매출" fill="#4F46E5" radius={[12, 12, 0, 0]} barSize={32} />
@@ -396,7 +460,7 @@ const App = () => {
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart data={monthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
-                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 600}} dy={10} />
+                            <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 800}} dy={10} />
                             <YAxis hide />
                             <Tooltip cursor={{fill: '#EFF6FF', radius: 12}} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} />
                             <Bar name="조회수" dataKey="조회수" fill="#3B82F6" radius={[12, 12, 0, 0]} barSize={50} />
@@ -406,7 +470,7 @@ const App = () => {
                     </div>
                   </div>
                   <div className="bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl shadow-slate-200/30">
-                    <h3 className="font-black text-lg flex items-center gap-3 text-blue-500 mb-10"><div className="w-1.5 h-6 bg-blue-400 rounded-full"></div> 일별 유입(조회수) 상세 흐름</h3>
+                    <h3 className="font-black text-lg flex items-center gap-3 text-blue-500 mb-10"><div className="w-1.5 h-6 bg-blue-400 rounded-full"></div> 일별 유입(조회수) 시계열 흐름</h3>
                     <div className="h-96">
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={dailyTrend}>
@@ -423,41 +487,37 @@ const App = () => {
                   <div className="p-8 bg-slate-50/40 flex flex-col md:flex-row gap-6 border-b border-slate-50">
                     <div className="relative flex-1 group">
                       <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 transition-colors" size={20} />
-                      <input type="text" placeholder="상품명 검색..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-16 pr-8 py-5 bg-white border border-slate-200 rounded-[28px] focus:outline-none focus:ring-4 focus:ring-indigo-500/5 transition-all font-semibold shadow-sm" />
+                      <input type="text" placeholder="검색: 상품명 또는 ID..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-16 pr-8 py-5 bg-white border border-slate-200 rounded-[28px] focus:outline-none focus:ring-4 focus:ring-blue-500/5 transition-all font-black shadow-sm" />
                     </div>
-                    {/* [FIX] Restore the "Name Changed Only" filter button */}
-                    <button 
-                      onClick={() => setShowOnlyNameChanged(!showOnlyNameChanged)} 
-                      className={`px-8 py-5 rounded-[28px] font-black text-sm transition-all whitespace-nowrap shadow-lg flex items-center gap-2 ${showOnlyNameChanged ? 'bg-indigo-600 text-white shadow-indigo-200' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'}`}
-                    >
-                      <History size={18} /> 명칭 변경 상품 필터
+                    <button onClick={() => setShowOnlyNameChanged(!showOnlyNameChanged)} className={`px-8 py-5 rounded-[28px] font-black text-sm transition-all whitespace-nowrap shadow-lg flex items-center gap-2 ${showOnlyNameChanged ? 'bg-blue-600 text-white shadow-blue-200' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'}`}>
+                      <History size={18} /> 명칭 변경 상품만 보기
                     </button>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-left">
                       <thead>
                         <tr className="border-b border-slate-50 text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-50/20">
-                          <th className="px-10 py-6">상품 정보</th>
+                          <th className="px-10 py-6">상품 정보 (줄바꿈 허용)</th>
                           {[{ label: '조회수', key: '상품상세조회수' }, { label: '주문량', key: '결제상품수량' }, { label: '매출액', key: '결제금액' }, { label: '전환율', key: '상세조회대비결제율' }].map(col => (
-                            <th key={col.key} className="px-6 py-6 cursor-pointer hover:text-indigo-600 group" onClick={() => handleSort(col.key)}>
-                              <div className="flex items-center gap-1.5">{col.label}<ArrowUpDown size={12} className={sortConfig.key === col.key ? 'text-indigo-600' : 'text-slate-200 group-hover:text-slate-400'} /></div>
+                            <th key={col.key} className="px-6 py-6 cursor-pointer hover:text-blue-600 group transition-colors" onClick={() => handleSort(col.key)}>
+                              <div className="flex items-center gap-1.5">{col.label}<ArrowUpDown size={12} className={sortConfig.key === col.key ? 'text-blue-600' : 'text-slate-200 group-hover:text-slate-400'} /></div>
                             </th>
                           ))}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50">
                         {sortedData.map((item, idx) => (
-                          <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer group" onClick={() => setSelectedProduct(item)}>
-                            <td className="px-10 py-8 min-w-[320px]">
-                              <div className="font-black text-slate-900 group-hover:text-indigo-600 transition-colors flex items-start gap-2 whitespace-normal break-all max-w-[400px] leading-relaxed">
-                                {item.lastName} {item.nameCount > 1 && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded-full font-black mt-1 uppercase shrink-0">변경됨</span>}
+                          <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer group transition-colors" onClick={() => setSelectedProduct(item)}>
+                            <td className="px-10 py-8 min-w-[350px]">
+                              <div className="font-black text-slate-900 group-hover:text-blue-600 transition-colors flex items-start gap-2 whitespace-normal break-all max-w-[450px] leading-relaxed">
+                                {item.lastName} {item.nameCount > 1 && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded font-black mt-1 uppercase shrink-0">Modified</span>}
                               </div>
-                              <div className="text-[10px] text-slate-400 mt-2 font-bold tracking-tight">ID: {item.상품ID}</div>
+                              <div className="text-[10px] text-slate-400 mt-2 font-black tracking-widest">CODE: {item.상품ID}</div>
                             </td>
-                            <td className="px-6 py-8 font-bold text-slate-700">{item.상품상세조회수.toLocaleString()} 회</td>
-                            <td className="px-6 py-8 font-bold text-slate-700">{item.결제상품수량.toLocaleString()} 건</td>
-                            <td className="px-6 py-8 font-black text-slate-900 whitespace-nowrap">₩{item.결제금액.toLocaleString()}</td>
-                            <td className="px-6 py-8"><span className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-full text-xs font-black">{(item.상세조회대비결제율 * 100).toFixed(2)}%</span></td>
+                            <td className="px-6 py-8 font-black text-slate-700">{item.상품상세조회수.toLocaleString()}</td>
+                            <td className="px-6 py-8 font-black text-slate-700">{item.결제상품수량.toLocaleString()}</td>
+                            <td className="px-6 py-8 font-black text-slate-900 whitespace-nowrap italic">₩{item.결제금액.toLocaleString()}</td>
+                            <td className="px-6 py-8"><span className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-lg text-xs font-black">{(item.상세조회대비결제율 * 100).toFixed(2)}%</span></td>
                           </tr>
                         ))}
                       </tbody>
@@ -470,15 +530,16 @@ const App = () => {
         </div>
       </main>
 
+      {/* 상품별 상세 모달 */}
       {selectedProduct && (
-        <div className="fixed inset-0 bg-slate-900/20 backdrop-blur-2xl z-50 flex items-center justify-center p-8 animate-in fade-in duration-300">
-          <div className="bg-white w-full max-w-7xl max-h-[94vh] rounded-[64px] shadow-2xl border border-white flex flex-col overflow-hidden animate-in zoom-in-95 duration-700">
+        <div className="fixed inset-0 bg-slate-900/30 backdrop-blur-2xl z-50 flex items-center justify-center p-8 animate-in fade-in duration-300">
+          <div className="bg-white w-full max-w-7xl max-h-[94vh] rounded-[64px] shadow-2xl border-4 border-white flex flex-col overflow-hidden animate-in zoom-in-95 duration-500">
             <div className="px-12 py-12 flex items-center justify-between border-b border-slate-50">
               <div className="flex items-center gap-10">
                 <div className="bg-blue-600 p-6 rounded-[32px] text-white shadow-2xl shrink-0"><Eye size={36} /></div>
                 <div className="max-w-[800px]">
-                  <h3 className="text-3xl font-black text-slate-900 leading-tight whitespace-normal break-words">{selectedProduct.lastName}</h3>
-                  <p className="text-xs text-slate-400 font-bold mt-2 tracking-[0.2em] uppercase">상품 고유번호: {selectedProduct.상품ID}</p>
+                  <h3 className="text-3xl font-black text-slate-900 leading-tight whitespace-normal break-words tracking-tighter italic">{selectedProduct.lastName}</h3>
+                  <p className="text-xs text-slate-400 font-black mt-2 tracking-[0.3em] uppercase opacity-60 italic">Product Identity: {selectedProduct.상품ID}</p>
                 </div>
               </div>
               <button onClick={() => setSelectedProduct(null)} className="w-16 h-16 bg-slate-50 hover:bg-white hover:shadow-2xl rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100 hover:rotate-90 duration-500"><X size={28} /></button>
@@ -496,31 +557,31 @@ const App = () => {
                 <div className="space-y-8">
                   <div className="flex items-center gap-4">
                     <div className="w-10 h-10 rounded-2xl bg-blue-50 flex items-center justify-center text-blue-600 shadow-sm"><History size={20} /></div>
-                    <h4 className="text-xl font-black text-slate-900 tracking-tight">상품명 변경에 따른 성과 비교</h4>
+                    <h4 className="text-xl font-black text-slate-900 tracking-tight italic">명칭 변경 이력 분석 (Name Variant Comparison)</h4>
                   </div>
-                  <div className="bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-2xl shadow-slate-100/50">
+                  <div className="bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-2xl">
                     <table className="w-full text-left text-sm">
                       <thead>
                         <tr className="bg-slate-50/60 text-[10px] font-black text-slate-400 uppercase tracking-widest">
                           <th className="px-10 py-6">상품명</th>
                           <th className="px-4 py-6 text-center">기간</th>
-                          <th className="px-4 py-6 text-right text-blue-600">조회수</th>
+                          <th className="px-4 py-6 text-right">조회수</th>
                           <th className="px-4 py-6 text-right">매출액</th>
-                          <th className="px-4 py-6 text-right text-indigo-600 bg-indigo-50/20">일평균 매출</th>
-                          <th className="px-4 py-6 text-right text-sky-600">일평균 유입</th>
+                          <th className="px-4 py-6 text-right italic">일평균 매출</th>
+                          <th className="px-4 py-6 text-right">일평균 유입</th>
                           <th className="px-10 py-6 text-right">전환율</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50">
                         {selectedProduct.performanceByName.map((p, i) => (
-                          <tr key={i} className="hover:bg-slate-50/30 transition-colors">
+                          <tr key={i} className="hover:bg-slate-50/30 transition-colors font-black">
                             <td className="px-10 py-6 font-bold text-slate-800 italic whitespace-normal break-words max-w-[300px]">"{p.name}"</td>
-                            <td className="px-4 py-6 text-center text-slate-400 text-[11px] font-bold">{p.periodStart.slice(5)} - {p.periodEnd === globalMaxDate ? '현재' : p.periodEnd.slice(5)} ({p.days}일)</td>
-                            <td className="px-4 py-6 text-right font-black text-blue-600">{p.totalViews.toLocaleString()}회</td>
-                            <td className="px-4 py-6 text-right font-bold text-slate-900">₩{p.totalRevenue.toLocaleString()}</td>
-                            <td className="px-4 py-6 text-right font-black text-indigo-600 bg-indigo-50/10">₩{Math.round(p.dailyAvgRevenue).toLocaleString()}</td>
-                            <td className="px-4 py-6 text-right font-bold text-sky-600">{p.dailyAvgViews.toFixed(1)}회</td>
-                            <td className="px-10 py-6 text-right font-black text-emerald-600">{p.cvr.toFixed(2)}%</td>
+                            <td className="px-4 py-6 text-center text-slate-400 text-[11px]">{p.periodStart.replace(/-/g,'.')} - {p.periodEnd === globalMaxDate ? '현재' : p.periodEnd.replace(/-/g,'.')} ({p.days}일)</td>
+                            <td className="px-4 py-6 text-right">{p.totalViews.toLocaleString()}회</td>
+                            <td className="px-4 py-6 text-right">₩{p.totalRevenue.toLocaleString()}</td>
+                            <td className="px-4 py-6 text-right text-indigo-600">₩{Math.round(p.dailyAvgRevenue).toLocaleString()}</td>
+                            <td className="px-4 py-6 text-right text-sky-600">{p.dailyAvgViews.toFixed(1)}회</td>
+                            <td className="px-10 py-6 text-right text-emerald-600">{p.cvr.toFixed(2)}%</td>
                           </tr>
                         ))}
                       </tbody>
@@ -532,32 +593,30 @@ const App = () => {
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={selectedProduct.history}>
                     <defs><linearGradient id="colorProdViews" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3B82F6" stopOpacity={0.15}/><stop offset="95%" stopColor="#3B82F6" stopOpacity={0}/></linearGradient></defs>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area type="monotone" dataKey="조회수" stroke="#3B82F6" strokeWidth={5} fillOpacity={1} fill="url(#colorProdViews)" />
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area name="조회수" type="monotone" dataKey="조회수" stroke="#3B82F6" strokeWidth={5} fillOpacity={1} fill="url(#colorProdViews)" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
             </div>
-            <div className="p-12 bg-white border-t border-slate-50 flex justify-center"><button onClick={() => setSelectedProduct(null)} className="px-32 py-6 bg-slate-900 text-white rounded-[32px] font-black text-lg hover:scale-105 transition-all">닫기</button></div>
+            <div className="p-12 bg-white border-t border-slate-50 flex justify-center"><button onClick={() => setSelectedProduct(null)} className="px-32 py-6 bg-slate-900 text-white rounded-[32px] font-black text-lg hover:scale-105 transition-all shadow-xl shadow-slate-200">데이터 창 닫기</button></div>
           </div>
         </div>
       )}
 
+      {/* 알림 토스트 */}
       {statusMessage && (
         <div className={`fixed bottom-10 right-10 px-8 py-5 rounded-[28px] shadow-2xl text-white font-black flex items-center gap-4 animate-in slide-in-from-bottom-8 z-[200] ${statusMessage.type === 'error' ? 'bg-rose-500' : 'bg-slate-900'}`}>
           {statusMessage.type === 'error' ? <AlertCircle size={20} /> : <CheckCircle2 size={20} />}
-          <span className="tracking-tight">{statusMessage.text}</span>
+          <span className="tracking-tight leading-none">{statusMessage.text}</span>
           <button onClick={() => setStatusMessage(null)} className="ml-4 opacity-50"><X size={18} /></button>
         </div>
       )}
 
+      {/* 화면 전체를 가리는 대신 화면 전환 없이 처리 표시를 띄우기 위한 스피너 (수정됨) */}
       {isProcessing && (
-        <div className="fixed inset-0 bg-white/90 backdrop-blur-2xl z-[100] flex flex-col items-center justify-center">
-          <div className="relative w-32 h-32 mb-10">
-            <div className="absolute inset-0 border-[12px] border-slate-50 rounded-full"></div>
-            <div className="absolute inset-0 border-[12px] border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-          </div>
-          <h2 className="text-3xl font-black text-slate-900 tracking-tighter uppercase italic">데이터 분석 중...</h2>
-          <p className="text-slate-400 mt-4 font-black tracking-[0.3em] uppercase text-[11px]">스마트 분석 엔진 가동 중</p>
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-5 bg-white/90 backdrop-blur-2xl rounded-[28px] shadow-2xl border border-slate-100 flex items-center gap-4 z-[100] animate-in slide-in-from-bottom-8">
+          <div className="w-5 h-5 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+          <span className="font-black text-slate-900 tracking-tighter italic">스마트 병합 엔진 가동 중...</span>
         </div>
       )}
     </div>
