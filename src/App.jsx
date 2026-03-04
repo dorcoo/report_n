@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { 
-  Upload, BarChart3, TrendingUp, ShoppingCart, 
+  Upload, BarChart3, TrendingUp, TrendingDown, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
   ChevronRight, X, LayoutDashboard, 
   History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight
@@ -32,10 +32,11 @@ const App = () => {
   // --- UI 및 진행 상태 ---
   const [isUploading, setIsUploading] = useState(false);
   const [isFetching, setIsFetching] = useState(true);
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, products, increased, decreased
   const [searchTerm, setSearchTerm] = useState('');
   const [showOnlyNameChanged, setShowOnlyNameChanged] = useState(false);
   const [sortConfig, setSortConfig] = useState({ key: '상품상세조회수', direction: 'desc' });
+  const [trendSortConfig, setTrendSortConfig] = useState({ key: 'diff', direction: 'desc' });
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [statusMessage, setStatusMessage] = useState(null);
@@ -43,6 +44,10 @@ const App = () => {
   const [hasConnectionError, setHasConnectionError] = useState(false);
   const [isWakingUp, setIsWakingUp] = useState(false);
   const [isLibLoaded, setIsLibLoaded] = useState(false);
+
+  // --- 날짜 비교 상태 ---
+  const [targetDate, setTargetDate] = useState('');
+  const [compareDate, setCompareDate] = useState('');
 
   // 1. 초기 인증 체크 (세션 유지)
   useEffect(() => {
@@ -274,6 +279,85 @@ const App = () => {
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
 
   /**
+   * 이용 가능한 모든 날짜 목록 추출
+   */
+  const availableDates = useMemo(() => {
+    const dates = new Set();
+    processedData.forEach(p => p.history?.forEach(h => dates.add(h.date)));
+    return Array.from(dates).sort((a, b) => b.localeCompare(a));
+  }, [processedData]);
+
+  // 데이터가 로드되면 기본 비교 날짜 설정 (최신일과 그 전날)
+  useEffect(() => {
+    if (availableDates.length >= 2) {
+      setTargetDate(availableDates[0]);
+      setCompareDate(availableDates[1]);
+    } else if (availableDates.length === 1) {
+      setTargetDate(availableDates[0]);
+      setCompareDate(availableDates[0]);
+    }
+  }, [availableDates]);
+
+  /**
+   * 선택된 날짜 기준 조회수 상승/하락 데이터 계산
+   */
+  const viewChangeData = useMemo(() => {
+    if (!processedData || processedData.length === 0 || !targetDate || !compareDate) {
+      return { increased: [], decreased: [] };
+    }
+
+    const increased = [];
+    const decreased = [];
+
+    processedData.forEach(product => {
+      const latestRecord = product.history?.find(h => h.date === targetDate);
+      const prevRecord = product.history?.find(h => h.date === compareDate);
+
+      // 둘 다 데이터가 없으면 패스 (혹은 한쪽만 있어도 0으로 비교)
+      const latestViews = latestRecord ? latestRecord.조회수 : 0;
+      const prevViews = prevRecord ? prevRecord.조회수 : 0;
+      
+      const diff = latestViews - prevViews;
+
+      if (diff > 0) {
+        increased.push({ ...product, latestViews, prevViews, diff });
+      } else if (diff < 0) {
+        decreased.push({ ...product, latestViews, prevViews, diff });
+      }
+    });
+
+    return { increased, decreased };
+  }, [processedData, targetDate, compareDate]);
+
+  // 추이 분석 소팅 핸들러
+  const handleTrendSort = (key) => setTrendSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
+
+  // 추이 분석(상승/하락) 테이블용 필터링 및 소팅
+  const sortedTrendData = useMemo(() => {
+    const currentTrendData = activeTab === 'increased' ? viewChangeData.increased : viewChangeData.decreased;
+    let filtered = currentTrendData.filter(p => 
+      String(p.lastName || '').toLowerCase().includes(searchTerm.toLowerCase()) || 
+      String(p.상품ID || '').includes(searchTerm)
+    );
+
+    if (trendSortConfig.key) {
+      filtered.sort((a, b) => {
+        const valA = Number(a[trendSortConfig.key]) || 0;
+        const valB = Number(b[trendSortConfig.key]) || 0;
+        
+        // 변화량 정렬 시, 하락 탭에서는 하락폭(절댓값)이 큰 순서가 먼저 오도록 UX 최적화
+        if (trendSortConfig.key === 'diff' && activeTab === 'decreased') {
+            return trendSortConfig.direction === 'desc' ? Math.abs(valB) - Math.abs(valA) : Math.abs(valA) - Math.abs(valB);
+        }
+
+        return trendSortConfig.direction === 'asc' ? valA - valB : valB - valA;
+      });
+    }
+
+    return filtered;
+  }, [viewChangeData, activeTab, searchTerm, trendSortConfig]);
+
+  /**
    * 로그인 화면 렌더링
    */
   if (!isAuthorized) {
@@ -327,12 +411,21 @@ const App = () => {
           {!isSidebarCollapsed && <h1 className="font-black text-xl tracking-tighter text-slate-900 text-left">판매분석 <span className="text-emerald-600 font-bold text-sm ml-1 uppercase italic text-left">PRO</span></h1>}
         </div>
         
-        <nav className="flex-1 px-4 py-6 space-y-2">
+        <nav className="flex-1 px-4 py-6 space-y-2 overflow-y-auto">
           <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'dashboard' ? 'bg-emerald-50 text-emerald-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
             <LayoutDashboard size={20} /> {!isSidebarCollapsed && <span>성장 리포트</span>}
           </button>
           <button onClick={() => setActiveTab('products')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'products' ? 'bg-emerald-50 text-emerald-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
             <ShoppingCart size={20} /> {!isSidebarCollapsed && <span>상품 분석</span>}
+          </button>
+
+          {!isSidebarCollapsed && <div className="h-px bg-slate-100 my-4 mx-2"></div>}
+          
+          <button onClick={() => setActiveTab('increased')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'increased' ? 'bg-emerald-50 text-emerald-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
+            <TrendingUp size={20} /> {!isSidebarCollapsed && <span>조회수 상승 상품</span>}
+          </button>
+          <button onClick={() => setActiveTab('decreased')} className={`w-full flex items-center gap-4 p-3.5 rounded-2xl transition-all ${activeTab === 'decreased' ? 'bg-rose-50 text-rose-700 shadow-sm font-bold' : 'text-slate-400 hover:bg-slate-50'}`}>
+            <TrendingDown size={20} /> {!isSidebarCollapsed && <span>조회수 하락 상품</span>}
           </button>
         </nav>
 
@@ -377,7 +470,12 @@ const App = () => {
       <main className={`transition-all duration-300 ${isSidebarCollapsed ? 'pl-20' : 'pl-64'}`}>
         <header className="h-20 bg-white/80 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between px-10 border-b border-slate-100 text-left">
           <div className="flex items-center gap-4 text-left">
-             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none text-left">{activeTab === 'dashboard' ? '서버 통합 리포트' : '상품별 상세 분석'}</h2>
+             <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none text-left">
+               {activeTab === 'dashboard' ? '서버 통합 리포트' : 
+                activeTab === 'products' ? '상품별 상세 분석' : 
+                activeTab === 'increased' ? '전날 대비 조회수 상승 상품' : 
+                '전날 대비 조회수 하락 상품'}
+             </h2>
              <div className="flex items-center gap-2">
                <div className={`h-2 w-2 rounded-full ${isFetching || isUploading ? 'bg-amber-400 animate-pulse' : hasConnectionError ? 'bg-rose-500' : 'bg-emerald-500'}`}></div>
                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest text-left">Real-time PRO</span>
@@ -403,25 +501,27 @@ const App = () => {
           ) : (
             <>
               {/* 요약 카드 */}
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 text-left">
-                {[
-                  { label: '누적 매출액', val: `₩${summary.revenue.toLocaleString()}`, icon: TrendingUp },
-                  { label: '누적 유입수', val: `${summary.views.toLocaleString()}회`, icon: Eye },
-                  { label: '일평균 유입', val: `${summary.dailyAvgViews.toFixed(0)}회`, icon: MousePointer2 },
-                  { label: '평균 결제 전환율', val: `${summary.conversionRate.toFixed(2)}%`, icon: CheckCircle2 }
-                ].map((s, i) => (
-                  <div key={i} className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-xl shadow-slate-200/40 hover:translate-y-[-4px] transition-all group text-left">
-                    <div className="flex justify-between items-start mb-6 text-left">
-                      <div className="p-4 rounded-3xl bg-emerald-50 text-emerald-600 group-hover:bg-emerald-600 group-hover:text-white transition-colors text-left"><s.icon size={24} /></div>
-                      <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest text-left">PRO METRIC</span>
+              {activeTab === 'dashboard' && (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 text-left">
+                  {[
+                    { label: '누적 매출액', val: `₩${summary.revenue.toLocaleString()}`, icon: TrendingUp },
+                    { label: '누적 유입수', val: `${summary.views.toLocaleString()}회`, icon: Eye },
+                    { label: '일평균 유입', val: `${summary.dailyAvgViews.toFixed(0)}회`, icon: MousePointer2 },
+                    { label: '평균 결제 전환율', val: `${summary.conversionRate.toFixed(2)}%`, icon: CheckCircle2 }
+                  ].map((s, i) => (
+                    <div key={i} className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-xl shadow-slate-200/40 hover:translate-y-[-4px] transition-all group text-left">
+                      <div className="flex justify-between items-start mb-6 text-left">
+                        <div className="p-4 rounded-3xl bg-emerald-50 text-emerald-600 group-hover:bg-emerald-600 group-hover:text-white transition-colors text-left"><s.icon size={24} /></div>
+                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest text-left">PRO METRIC</span>
+                      </div>
+                      <p className="text-[11px] font-black text-slate-400 uppercase tracking-widest mb-1 text-left">{s.label}</p>
+                      <h4 className="text-3xl font-black text-slate-900 tracking-tighter text-left">{s.val}</h4>
                     </div>
-                    <p className="text-[11px] font-black text-slate-400 uppercase tracking-widest mb-1 text-left">{s.label}</p>
-                    <h4 className="text-3xl font-black text-slate-900 tracking-tighter text-left">{s.val}</h4>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
 
-              {activeTab === 'dashboard' ? (
+              {activeTab === 'dashboard' && (
                 <div className="space-y-10 animate-in fade-in slide-in-from-bottom-6 duration-700 text-left">
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 text-left">
                     <div className="bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
@@ -469,7 +569,9 @@ const App = () => {
                     </div>
                   </div>
                 </div>
-              ) : (
+              )}
+
+              {activeTab === 'products' && (
                 <div className="bg-white rounded-[48px] border border-slate-100 shadow-2xl overflow-hidden animate-in zoom-in-95 duration-500 flex flex-col text-left">
                   <div className="p-8 bg-slate-50/40 flex flex-col md:flex-row gap-6 border-b border-slate-50 text-left">
                     <div className="relative flex-1 group text-left">
@@ -514,6 +616,96 @@ const App = () => {
                     </table>
                   </div>
                   {visibleCount < sortedData.length && (
+                    <div className="p-6 bg-slate-50/30 flex justify-center border-t border-slate-50 text-left">
+                      <button onClick={() => setVisibleCount(v => v + 50)} className="px-8 py-3 bg-white border border-slate-200 text-slate-600 rounded-full font-bold text-sm hover:bg-slate-50 hover:text-emerald-600 transition-colors flex items-center gap-2 shadow-sm text-left">
+                        데이터 더 보기 <ChevronDown size={16} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* 전날 대비 상승/하락 조회수 테이블 */}
+              {(activeTab === 'increased' || activeTab === 'decreased') && (
+                <div className="bg-white rounded-[48px] border border-slate-100 shadow-2xl overflow-hidden animate-in zoom-in-95 duration-500 flex flex-col text-left">
+                  <div className="p-8 bg-slate-50/40 flex flex-col md:flex-row gap-6 border-b border-slate-50 text-left items-center justify-between">
+                    <div className="relative flex-1 max-w-md group text-left">
+                      <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 transition-colors text-left" size={20} />
+                      <input type="text" placeholder="상품명 또는 ID 검색..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-16 pr-8 py-5 bg-white border border-slate-200 rounded-[28px] focus:outline-none focus:ring-4 focus:ring-emerald-500/5 transition-all font-black shadow-sm text-left" />
+                    </div>
+                    {availableDates.length >= 2 ? (
+                      <div className="flex items-center gap-3 bg-white px-6 py-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
+                        <span className="text-[10px] font-black tracking-widest uppercase text-slate-400">비교 기간 설정</span>
+                        <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                          <select 
+                            value={compareDate} 
+                            onChange={(e) => setCompareDate(e.target.value)}
+                            className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500/20 cursor-pointer"
+                          >
+                            {availableDates.map(d => <option key={`prev-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
+                          </select>
+                          <ArrowRight size={14} className="text-slate-300" />
+                          <select 
+                            value={targetDate} 
+                            onChange={(e) => setTargetDate(e.target.value)}
+                            className={`${activeTab === 'increased' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'} border px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-opacity-50 cursor-pointer`}
+                          >
+                            {availableDates.map(d => <option key={`curr-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-xs font-bold text-rose-500 bg-rose-50 px-4 py-2 rounded-xl">비교 가능한 2일치 이상의 데이터가 필요합니다.</div>
+                    )}
+                  </div>
+                  
+                  <div className="overflow-x-auto text-left">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="border-b border-slate-50 text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-50/20 text-left">
+                          <th className="px-10 py-6 text-left">상품 정보</th>
+                          <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600 select-none" onClick={() => handleTrendSort('prevViews')}>
+                            이전 조회수 {trendSortConfig.key === 'prevViews' && (trendSortConfig.direction === 'desc' ? '↓' : '↑')}
+                          </th>
+                          <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600 select-none" onClick={() => handleTrendSort('latestViews')}>
+                            기준 조회수 {trendSortConfig.key === 'latestViews' && (trendSortConfig.direction === 'desc' ? '↓' : '↑')}
+                          </th>
+                          <th className="px-10 py-6 text-right cursor-pointer hover:text-emerald-600 select-none" onClick={() => handleTrendSort('diff')}>
+                            변화량 {trendSortConfig.key === 'diff' && (trendSortConfig.direction === 'desc' ? '↓' : '↑')}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50 text-left">
+                        {sortedTrendData.length === 0 ? (
+                           <tr>
+                             <td colSpan={4} className="px-10 py-20 text-center text-slate-400 font-bold">
+                               해당하는 데이터가 없습니다. (비교 가능한 날짜가 부족할 수 있습니다)
+                             </td>
+                           </tr>
+                        ) : (
+                          sortedTrendData.slice(0, visibleCount).map((item, idx) => (
+                            <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer text-left transition-colors" onClick={() => setSelectedProduct(item)}>
+                              <td className="px-10 py-8 min-w-[350px] text-left">
+                                <div className="font-black text-slate-900 group-hover:text-emerald-600 transition-colors text-left leading-relaxed">
+                                  {String(item.lastName || '이름 없음')}
+                                </div>
+                                <div className="text-[10px] text-slate-400 mt-2 font-black tracking-widest uppercase text-left">ID: {String(item.상품ID || '')}</div>
+                              </td>
+                              <td className="px-6 py-8 font-black text-slate-400 text-left">{(Number(item.prevViews) || 0).toLocaleString()}</td>
+                              <td className="px-6 py-8 font-black text-slate-700 text-left">{(Number(item.latestViews) || 0).toLocaleString()}</td>
+                              <td className="px-10 py-8 text-right">
+                                <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-black ${item.diff > 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+                                  {item.diff > 0 ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
+                                  {item.diff > 0 ? '+' : ''}{item.diff.toLocaleString()}
+                                </div>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                  {visibleCount < sortedTrendData.length && (
                     <div className="p-6 bg-slate-50/30 flex justify-center border-t border-slate-50 text-left">
                       <button onClick={() => setVisibleCount(v => v + 50)} className="px-8 py-3 bg-white border border-slate-200 text-slate-600 rounded-full font-bold text-sm hover:bg-slate-50 hover:text-emerald-600 transition-colors flex items-center gap-2 shadow-sm text-left">
                         데이터 더 보기 <ChevronDown size={16} />
