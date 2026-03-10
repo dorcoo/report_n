@@ -15,7 +15,7 @@ import {
  */
 const SERVER_URL = 'https://report-backend-0fwr.onrender.com';
 const EXCEL_LIB_URL = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
-const APP_PASSWORD = '121213'; // 여기에 사용할 암호를 설정하세요.
+const APP_PASSWORD = '3522'; // 여기에 사용할 암호를 설정하세요.
 
 const App = () => {
   // --- 인증 상태 ---
@@ -819,3 +819,4 @@ const App = () => {
 };
 
 export default App;
+
