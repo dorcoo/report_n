@@ -3,7 +3,7 @@ import {
   Upload, BarChart3, TrendingUp, TrendingDown, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
   ChevronRight, X, LayoutDashboard, 
-  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight
+  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight, Download, Calendar
 } from 'lucide-react';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, 
@@ -49,6 +49,10 @@ const App = () => {
   const [targetDate, setTargetDate] = useState('');
   const [compareDate, setCompareDate] = useState('');
 
+  // --- 글로벌 기간 필터 상태 ---
+  const [globalStartDate, setGlobalStartDate] = useState('');
+  const [globalEndDate, setGlobalEndDate] = useState('');
+
   // 1. 초기 인증 체크 (세션 유지)
   useEffect(() => {
     const savedAuth = sessionStorage.getItem('is_pro_authorized');
@@ -57,7 +61,7 @@ const App = () => {
     }
   }, []);
 
-  // 2. 엑셀 라이브러리 동적 로드
+  // 2. 엑셀 라이브러 동적 로드
   useEffect(() => {
     if (!document.querySelector(`script[src="${EXCEL_LIB_URL}"]`)) {
       const script = document.createElement("script");
@@ -250,19 +254,93 @@ const App = () => {
     }
   };
 
+  /**
+   * 이용 가능한 모든 날짜 목록 추출
+   */
+  const availableDates = useMemo(() => {
+    const dates = new Set();
+    processedData.forEach(p => p.history?.forEach(h => dates.add(h.date)));
+    return Array.from(dates).sort((a, b) => b.localeCompare(a));
+  }, [processedData]);
+
+  // 글로벌 날짜 필터 초기화
+  useEffect(() => {
+    if (availableDates.length > 0) {
+      if (!globalEndDate) setGlobalEndDate(availableDates[0]); // 최신 날짜
+      if (!globalStartDate) setGlobalStartDate(availableDates[availableDates.length - 1]); // 가장 오래된 날짜
+    }
+  }, [availableDates]);
+
+  /**
+   * 글로벌 날짜 필터가 적용된 파생 데이터 계산
+   */
+  const filteredDailyTrend = useMemo(() => {
+    if (!globalStartDate || !globalEndDate) return dailyTrend;
+    return dailyTrend.filter(d => d.date >= globalStartDate && d.date <= globalEndDate);
+  }, [dailyTrend, globalStartDate, globalEndDate]);
+
+  const filteredMonthlyTrend = useMemo(() => {
+    const monthlyMap = new Map();
+    filteredDailyTrend.forEach(d => {
+      const month = d.date.substring(0, 7);
+      if (!monthlyMap.has(month)) monthlyMap.set(month, { month, 매출: 0, 조회수: 0, 판매량: 0 });
+      const m = monthlyMap.get(month);
+      m.매출 += d.매출;
+      m.조회수 += d.조회수;
+      m.판매량 += d.판매량;
+    });
+    return Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
+  }, [filteredDailyTrend]);
+
+  const filteredProducts = useMemo(() => {
+    if (!processedData.length || !globalStartDate || !globalEndDate) return processedData;
+    
+    return processedData.map(product => {
+      const validHistory = product.history.filter(h => h.date >= globalStartDate && h.date <= globalEndDate);
+      const revenue = validHistory.reduce((s, h) => s + h.매출, 0);
+      const views = validHistory.reduce((s, h) => s + h.조회수, 0);
+      const sales = validHistory.reduce((s, h) => s + h.판매량, 0);
+      
+      const performanceByName = product.nameHistory.map(nh => {
+        const nameData = validHistory.filter(h => h.nameUsed === nh.name);
+        const tRev = nameData.reduce((s, h) => s + h.매출, 0);
+        const tSales = nameData.reduce((s, h) => s + h.판매량, 0);
+        const tViews = nameData.reduce((s, h) => s + h.조회수, 0);
+        const days = nameData.length || 1;
+        return { 
+          name: nh.name, totalRevenue: tRev, totalSales: tSales, totalViews: tViews,
+          dailyAvgRevenue: tRev / days,
+          dailyAvgViews: tViews / days,
+          cvr: tViews > 0 ? (tSales / tViews) * 100 : 0,
+          periodStart: nh.start, periodEnd: nh.end
+        };
+      }).filter(p => p.totalViews > 0 || p.totalRevenue > 0); // 선택된 기간에 활동이 있는 이름만
+
+      return {
+        ...product,
+        결제금액: revenue,
+        상품상세조회수: views,
+        결제상품수량: sales,
+        상세조회대비결제율: views > 0 ? sales / views : 0,
+        filteredHistory: validHistory,
+        performanceByName: performanceByName
+      };
+    }).filter(p => p.상품상세조회수 > 0 || p.결제금액 > 0 || p.결제상품수량 > 0);
+  }, [processedData, globalStartDate, globalEndDate]);
+
   const summary = useMemo(() => {
-    const totalRev = processedData.reduce((acc, curr) => acc + (Number(curr.결제금액) || 0), 0);
-    const totalSales = processedData.reduce((acc, curr) => acc + (Number(curr.결제상품수량) || 0), 0);
-    const totalViews = processedData.reduce((acc, curr) => acc + (Number(curr.상품상세조회수) || 0), 0);
+    const totalRev = filteredProducts.reduce((acc, curr) => acc + (Number(curr.결제금액) || 0), 0);
+    const totalSales = filteredProducts.reduce((acc, curr) => acc + (Number(curr.결제상품수량) || 0), 0);
+    const totalViews = filteredProducts.reduce((acc, curr) => acc + (Number(curr.상품상세조회수) || 0), 0);
     return { 
       revenue: totalRev, sales: totalSales, views: totalViews, 
-      dailyAvgViews: dailyTrend.length > 0 ? totalViews / dailyTrend.length : 0, 
+      dailyAvgViews: filteredDailyTrend.length > 0 ? totalViews / filteredDailyTrend.length : 0, 
       conversionRate: totalViews > 0 ? (totalSales / totalViews) * 100 : 0 
     };
-  }, [processedData, dailyTrend]);
+  }, [filteredProducts, filteredDailyTrend]);
 
   const sortedData = useMemo(() => {
-    let filtered = processedData.filter(p => 
+    let filtered = filteredProducts.filter(p => 
       (String(p.lastName || '').toLowerCase().includes(searchTerm.toLowerCase()) || String(p.상품ID || '').includes(searchTerm)) && 
       (showOnlyNameChanged ? (Number(p.nameCount) > 1) : true)
     );
@@ -274,18 +352,9 @@ const App = () => {
       });
     }
     return filtered;
-  }, [processedData, searchTerm, showOnlyNameChanged, sortConfig]);
+  }, [filteredProducts, searchTerm, showOnlyNameChanged, sortConfig]);
 
   const handleSort = (key) => setSortConfig(prev => ({ key, direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc' }));
-
-  /**
-   * 이용 가능한 모든 날짜 목록 추출
-   */
-  const availableDates = useMemo(() => {
-    const dates = new Set();
-    processedData.forEach(p => p.history?.forEach(h => dates.add(h.date)));
-    return Array.from(dates).sort((a, b) => b.localeCompare(a));
-  }, [processedData]);
 
   // 데이터가 로드되면 기본 비교 날짜 설정 (최신일과 그 전날)
   useEffect(() => {
@@ -356,6 +425,93 @@ const App = () => {
 
     return filtered;
   }, [viewChangeData, activeTab, searchTerm, trendSortConfig]);
+
+  // 팝업용 상세 트렌드 차트 데이터 계산 (전환율 포함)
+  const historyWithCVR = useMemo(() => {
+    if (!selectedProduct) return [];
+    const hist = selectedProduct.filteredHistory || selectedProduct.history;
+    if (!hist) return [];
+    return hist.map(h => ({
+      ...h,
+      전환율: h.조회수 > 0 ? Number(((h.판매량 / h.조회수) * 100).toFixed(2)) : 0
+    }));
+  }, [selectedProduct]);
+
+  /**
+   * 화면에 표시된 데이터 엑셀 다운로드
+   */
+  const handleExportExcel = () => {
+    if (!window.XLSX) {
+      setStatusMessage({ type: 'error', text: '엑셀 기능을 불러오고 있습니다. 잠시 후 다시 시도해주세요.' });
+      return;
+    }
+
+    let exportData = [];
+    let fileName = 'export.xlsx';
+
+    if (activeTab === 'products') {
+      exportData = sortedData.map(item => ({
+        '상품명': item.lastName || '이름 없음',
+        '상품ID': item.상품ID,
+        '조회수': Number(item.상품상세조회수) || 0,
+        '주문량': Number(item.결제상품수량) || 0,
+        '매출액': Number(item.결제금액) || 0,
+        '전환율(%)': Number((Number(item.상세조회대비결제율) * 100).toFixed(2))
+      }));
+      fileName = '상품분석_목록.xlsx';
+    } else if (activeTab === 'increased' || activeTab === 'decreased') {
+      exportData = sortedTrendData.map(item => ({
+        '상품명': item.lastName || '이름 없음',
+        '상품ID': item.상품ID,
+        '이전 조회수': Number(item.prevViews) || 0,
+        '기준 조회수': Number(item.latestViews) || 0,
+        '변화량': Number(item.diff) || 0
+      }));
+      fileName = activeTab === 'increased' ? '조회수_상승_상품.xlsx' : '조회수_하락_상품.xlsx';
+    } else {
+      return;
+    }
+
+    try {
+      const worksheet = window.XLSX.utils.json_to_sheet(exportData);
+      const workbook = window.XLSX.utils.book_new();
+      window.XLSX.utils.book_append_sheet(workbook, worksheet, "Data");
+      window.XLSX.writeFile(workbook, fileName);
+      setStatusMessage({ type: 'success', text: '엑셀 다운로드가 완료되었습니다.' });
+    } catch (e) {
+      setStatusMessage({ type: 'error', text: '엑셀 파일 생성 중 오류가 발생했습니다.' });
+    }
+  };
+
+  /**
+   * 상품 상세 팝업의 트렌드 데이터 엑셀 다운로드
+   */
+  const handleExportProductDetailExcel = () => {
+    if (!window.XLSX || !selectedProduct) {
+      setStatusMessage({ type: 'error', text: '엑셀 기능을 불러오고 있습니다. 잠시 후 다시 시도해주세요.' });
+      return;
+    }
+
+    const exportData = historyWithCVR.map(item => ({
+      '날짜': item.date,
+      '조회수': Number(item.조회수) || 0,
+      '주문량': Number(item.판매량) || 0,
+      '매출액': Number(item.매출) || 0,
+      '전환율(%)': Number(item.전환율) || 0
+    }));
+
+    try {
+      const worksheet = window.XLSX.utils.json_to_sheet(exportData);
+      const workbook = window.XLSX.utils.book_new();
+      window.XLSX.utils.book_append_sheet(workbook, worksheet, "상세_트렌드");
+      
+      const safeName = String(selectedProduct.lastName || '상품').replace(/[\/\\?%*:|"<>]/g, '');
+      window.XLSX.writeFile(workbook, `${safeName}_상세추이.xlsx`);
+      setStatusMessage({ type: 'success', text: '상세 추이 데이터 엑셀 다운로드가 완료되었습니다.' });
+    } catch (e) {
+      setStatusMessage({ type: 'error', text: '엑셀 파일 생성 중 오류가 발생했습니다.' });
+    }
+  };
 
   /**
    * 로그인 화면 렌더링
@@ -476,9 +632,33 @@ const App = () => {
                 activeTab === 'increased' ? '전날 대비 조회수 상승 상품' : 
                 '전날 대비 조회수 하락 상품'}
              </h2>
-             <div className="flex items-center gap-2">
-               <div className={`h-2 w-2 rounded-full ${isFetching || isUploading ? 'bg-amber-400 animate-pulse' : hasConnectionError ? 'bg-rose-500' : 'bg-emerald-500'}`}></div>
-               <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest text-left">Real-time PRO</span>
+             <div className="flex items-center gap-6">
+               {(activeTab === 'dashboard' || activeTab === 'products') && availableDates.length > 0 && (
+                 <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-2xl shadow-sm">
+                   <Calendar size={16} className="text-emerald-600" />
+                   <input 
+                     type="date" 
+                     value={globalStartDate} 
+                     min={availableDates[availableDates.length - 1]}
+                     max={globalEndDate}
+                     onChange={(e) => setGlobalStartDate(e.target.value)} 
+                     className="bg-transparent text-sm font-bold text-slate-700 outline-none cursor-pointer"
+                   />
+                   <span className="text-slate-300 font-black">-</span>
+                   <input 
+                     type="date" 
+                     value={globalEndDate} 
+                     min={globalStartDate}
+                     max={availableDates[0]}
+                     onChange={(e) => setGlobalEndDate(e.target.value)} 
+                     className="bg-transparent text-sm font-bold text-slate-700 outline-none cursor-pointer"
+                   />
+                 </div>
+               )}
+               <div className="flex items-center gap-2">
+                 <div className={`h-2 w-2 rounded-full ${isFetching || isUploading ? 'bg-amber-400 animate-pulse' : hasConnectionError ? 'bg-rose-500' : 'bg-emerald-500'}`}></div>
+                 <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black uppercase tracking-widest text-left">Real-time PRO</span>
+               </div>
              </div>
           </div>
           <button onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} className="p-2.5 hover:bg-slate-50 rounded-xl transition-all text-slate-400 active:scale-90 text-left"><Menu size={22} /></button>
@@ -528,7 +708,7 @@ const App = () => {
                       <h3 className="font-black text-lg mb-8 flex items-center gap-3 text-left"><div className="w-1.5 h-6 bg-emerald-600 rounded-full text-left"></div> 월간 매출 성장</h3>
                       <div className="h-72 text-left">
                         <ResponsiveContainer width="100%" height="100%">
-                          <BarChart data={monthlyTrend}>
+                          <BarChart data={filteredMonthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
                             <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 800}} dy={10} />
                             <YAxis hide />
@@ -543,7 +723,7 @@ const App = () => {
                       <h3 className="font-black text-lg mb-8 flex items-center gap-3 text-emerald-700 text-left"><div className="w-1.5 h-6 bg-emerald-500 rounded-full text-left"></div> 월간 유입수 변화</h3>
                       <div className="h-72 text-left">
                         <ResponsiveContainer width="100%" height="100%">
-                          <BarChart data={monthlyTrend}>
+                          <BarChart data={filteredMonthlyTrend}>
                             <CartesianGrid strokeDasharray="0" vertical={false} stroke="#F1F5F9" />
                             <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 800}} dy={10} />
                             <YAxis hide />
@@ -560,7 +740,7 @@ const App = () => {
                     <h3 className="font-black text-lg flex items-center gap-3 text-emerald-500 mb-10 text-left"><div className="w-1.5 h-6 bg-emerald-400 rounded-full text-left"></div> 일별 유입량 변화 추이</h3>
                     <div className="h-96 text-left">
                       <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={dailyTrend}>
+                        <AreaChart data={filteredDailyTrend}>
                           <defs><linearGradient id="colorViewsMain" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.2}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 25px 50px -12px rgb(0 0 0 / 0.25)'}} />
                           <Area name="일일 조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorViewsMain)" />
@@ -578,9 +758,14 @@ const App = () => {
                       <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 transition-colors text-left" size={20} />
                       <input type="text" placeholder="상품명 또는 ID 검색..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-16 pr-8 py-5 bg-white border border-slate-200 rounded-[28px] focus:outline-none focus:ring-4 focus:ring-emerald-500/5 transition-all font-black shadow-sm text-left" />
                     </div>
-                    <button onClick={() => setShowOnlyNameChanged(!showOnlyNameChanged)} className={`px-8 py-5 rounded-[28px] font-black text-sm transition-all shadow-lg flex items-center gap-2 ${showOnlyNameChanged ? 'bg-emerald-600 text-white shadow-emerald-200' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'}`}>
-                      <History size={18} /> 이름 변경 상품만 보기
-                    </button>
+                    <div className="flex gap-4">
+                      <button onClick={() => setShowOnlyNameChanged(!showOnlyNameChanged)} className={`px-8 py-5 rounded-[28px] font-black text-sm transition-all shadow-lg flex items-center gap-2 ${showOnlyNameChanged ? 'bg-emerald-600 text-white shadow-emerald-200' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'}`}>
+                        <History size={18} /> 이름 변경 상품만 보기
+                      </button>
+                      <button onClick={handleExportExcel} className="px-8 py-5 rounded-[28px] font-black text-sm transition-all shadow-lg flex items-center gap-2 bg-indigo-50 text-indigo-600 border border-indigo-100 hover:bg-indigo-100">
+                        <Download size={18} /> 엑셀 다운로드
+                      </button>
+                    </div>
                   </div>
                   <div className="overflow-x-auto text-left">
                     <table className="w-full text-left">
@@ -633,30 +818,35 @@ const App = () => {
                       <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 transition-colors text-left" size={20} />
                       <input type="text" placeholder="상품명 또는 ID 검색..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-16 pr-8 py-5 bg-white border border-slate-200 rounded-[28px] focus:outline-none focus:ring-4 focus:ring-emerald-500/5 transition-all font-black shadow-sm text-left" />
                     </div>
-                    {availableDates.length >= 2 ? (
-                      <div className="flex items-center gap-3 bg-white px-6 py-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
-                        <span className="text-[10px] font-black tracking-widest uppercase text-slate-400">비교 기간 설정</span>
-                        <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
-                          <select 
-                            value={compareDate} 
-                            onChange={(e) => setCompareDate(e.target.value)}
-                            className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500/20 cursor-pointer"
-                          >
-                            {availableDates.map(d => <option key={`prev-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
-                          </select>
-                          <ArrowRight size={14} className="text-slate-300" />
-                          <select 
-                            value={targetDate} 
-                            onChange={(e) => setTargetDate(e.target.value)}
-                            className={`${activeTab === 'increased' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'} border px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-opacity-50 cursor-pointer`}
-                          >
-                            {availableDates.map(d => <option key={`curr-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
-                          </select>
+                    <div className="flex items-center gap-4">
+                      {availableDates.length >= 2 ? (
+                        <div className="flex items-center gap-3 bg-white px-6 py-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
+                          <span className="text-[10px] font-black tracking-widest uppercase text-slate-400">비교 기간 설정</span>
+                          <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                            <select 
+                              value={compareDate} 
+                              onChange={(e) => setCompareDate(e.target.value)}
+                              className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500/20 cursor-pointer"
+                            >
+                              {availableDates.map(d => <option key={`prev-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
+                            </select>
+                            <ArrowRight size={14} className="text-slate-300" />
+                            <select 
+                              value={targetDate} 
+                              onChange={(e) => setTargetDate(e.target.value)}
+                              className={`${activeTab === 'increased' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'} border px-3 py-1.5 rounded-lg outline-none focus:ring-2 focus:ring-opacity-50 cursor-pointer`}
+                            >
+                              {availableDates.map(d => <option key={`curr-${d}`} value={d}>{d.replace(/-/g, '.')}</option>)}
+                            </select>
+                          </div>
                         </div>
-                      </div>
-                    ) : (
-                      <div className="text-xs font-bold text-rose-500 bg-rose-50 px-4 py-2 rounded-xl">비교 가능한 2일치 이상의 데이터가 필요합니다.</div>
-                    )}
+                      ) : (
+                        <div className="text-xs font-bold text-rose-500 bg-rose-50 px-4 py-2 rounded-xl">비교 가능한 2일치 이상의 데이터가 필요합니다.</div>
+                      )}
+                      <button onClick={handleExportExcel} className="px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-sm flex items-center gap-2 bg-indigo-50 text-indigo-600 border border-indigo-100 hover:bg-indigo-100 shrink-0">
+                        <Download size={18} /> 엑셀 다운로드
+                      </button>
+                    </div>
                   </div>
                   
                   <div className="overflow-x-auto text-left">
@@ -733,7 +923,7 @@ const App = () => {
               </div>
               <button onClick={() => setSelectedProduct(null)} className="w-16 h-16 bg-slate-50 hover:bg-white hover:shadow-2xl rounded-full flex items-center justify-center transition-all text-slate-400 border border-transparent hover:border-slate-100 hover:rotate-90 duration-500 text-left"><X size={28} /></button>
             </div>
-            <div className="flex-1 overflow-y-auto px-12 py-12 space-y-16 text-left">
+            <div className="flex-1 overflow-y-auto px-12 py-12 space-y-16 text-left bg-slate-50/10">
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 text-left">
                 {[
                   { label: '누적 유입수', val: `${(Number(selectedProduct.상품상세조회수) || 0).toLocaleString()}회` },
@@ -741,7 +931,7 @@ const App = () => {
                   { label: '누적 주문량', val: `${(Number(selectedProduct.결제상품수량) || 0).toLocaleString()}건` },
                   { label: '평균 전환율', val: `${(Number(selectedProduct.상세조회대비결제율) * 100).toFixed(2)}%` }
                 ].map((stat, i) => (
-                  <div key={i} className={`p-8 rounded-[40px] border shadow-sm bg-slate-50/30 border-slate-50 text-left`}>
+                  <div key={i} className={`p-8 rounded-[40px] border shadow-sm bg-white border-slate-50 text-left`}>
                     <p className={`text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-2 text-left`}>{stat.label}</p>
                     <p className="text-3xl font-black text-slate-900 tracking-tighter text-left">{stat.val}</p>
                   </div>
@@ -755,7 +945,7 @@ const App = () => {
                     <div className="w-10 h-10 rounded-2xl bg-emerald-50 flex items-center justify-center text-emerald-600 shadow-sm text-left"><History size={20} /></div>
                     <h4 className="text-xl font-black text-slate-900 tracking-tight italic text-left">명칭 변경 이력 및 성과 비교</h4>
                   </div>
-                  <div className="bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-2xl text-left">
+                  <div className="bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-xl text-left">
                     <table className="w-full text-left text-sm text-left">
                       <thead>
                         <tr className="bg-slate-50/60 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">
@@ -788,16 +978,67 @@ const App = () => {
                 </div>
               )}
 
-              {/* 상품 상세 트렌드 차트 */}
-              {Array.isArray(selectedProduct.history) && selectedProduct.history.length > 0 && (
-                <div className="h-80 bg-white p-10 rounded-[56px] border border-slate-100 shadow-2xl text-left">
-                  <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">상품 유입 변화 추이 그래프</h4>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={selectedProduct.history}>
-                      <defs><linearGradient id="colorProdViews" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.15}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
-                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area name="조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorProdViews)" />
-                    </AreaChart>
-                  </ResponsiveContainer>
+              {/* 상품 상세 트렌드 차트 그룹 */}
+              {historyWithCVR.length > 0 && (
+                <div className="space-y-6 text-left">
+                  <div className="flex items-center gap-4 text-left mb-2">
+                    <div className="w-10 h-10 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600 shadow-sm text-left"><BarChart3 size={20} /></div>
+                    <h4 className="text-xl font-black text-slate-900 tracking-tight italic text-left flex-1">상품 종합 성과 추이</h4>
+                    <button onClick={handleExportProductDetailExcel} className="px-5 py-2.5 rounded-xl font-black text-xs transition-all shadow-sm flex items-center gap-2 bg-indigo-50 text-indigo-600 border border-indigo-100 hover:bg-indigo-100 shrink-0">
+                      <Download size={14} /> 데이터 다운로드
+                    </button>
+                  </div>
+
+                  {/* 유입수 (조회수) 차트 */}
+                  <div className="h-72 bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                    <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">일별 유입(조회수) 변화</h4>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={historyWithCVR}>
+                        <defs><linearGradient id="colorProdViews" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.15}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip formatter={(value) => `${value.toLocaleString()}회`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area name="조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorProdViews)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 주문 수량(판매량) 차트 */}
+                  <div className="h-72 bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                    <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">일별 주문 수량 추이</h4>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={historyWithCVR}>
+                        <defs><linearGradient id="colorOrders" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#8B5CF6" stopOpacity={0.15}/><stop offset="95%" stopColor="#8B5CF6" stopOpacity={0}/></linearGradient></defs>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip formatter={(value) => `${value.toLocaleString()}건`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} /><Area name="주문 수량" type="monotone" dataKey="판매량" stroke="#8B5CF6" strokeWidth={5} fillOpacity={1} fill="url(#colorOrders)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 매출액 막대 그래프 */}
+                  <div className="h-72 bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                    <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">일별 매출액 추이</h4>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={historyWithCVR}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" />
+                        <XAxis dataKey="date" hide />
+                        <YAxis hide />
+                        <Tooltip formatter={(value) => `₩${value.toLocaleString()}`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} />
+                        <Bar name="매출액" dataKey="매출" fill="#3B82F6" radius={[8, 8, 0, 0]} barSize={20} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 전환율 영역 그래프 */}
+                  <div className="h-72 bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                    <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6 px-4 text-left">일별 전환율(CVR) 추이</h4>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={historyWithCVR}>
+                        <defs><linearGradient id="colorCvr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#F59E0B" stopOpacity={0.2}/><stop offset="95%" stopColor="#F59E0B" stopOpacity={0}/></linearGradient></defs>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" />
+                        <XAxis dataKey="date" hide />
+                        <YAxis hide />
+                        <Tooltip formatter={(value) => `${value}%`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)'}} />
+                        <Area name="전환율" type="monotone" dataKey="전환율" stroke="#F59E0B" strokeWidth={5} fillOpacity={1} fill="url(#colorCvr)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
               )}
             </div>
@@ -819,4 +1060,3 @@ const App = () => {
 };
 
 export default App;
-
