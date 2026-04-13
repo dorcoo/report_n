@@ -3,11 +3,11 @@ import {
   Upload, BarChart3, TrendingUp, TrendingDown, ShoppingCart, 
   Eye, Search, ArrowUpDown, CheckCircle2, AlertCircle, 
   ChevronRight, X, LayoutDashboard, 
-  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight, Download, Calendar
+  History, MousePointer2, RefreshCw, Server, Database, ChevronDown, Menu, Clock, Play, Lock, ArrowRight, Download, Calendar, ListOrdered
 } from 'lucide-react';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, 
-  ResponsiveContainer, AreaChart, Area, BarChart, Bar, Legend
+  ResponsiveContainer, AreaChart, Area, BarChart, Bar, Legend, Cell
 } from 'recharts';
 
 /**
@@ -35,7 +35,7 @@ const App = () => {
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, products, increased, decreased
   const [searchTerm, setSearchTerm] = useState('');
   const [showOnlyNameChanged, setShowOnlyNameChanged] = useState(false);
-  const [sortConfig, setSortConfig] = useState({ key: '상품상세조회수', direction: 'desc' });
+  const [sortConfig, setSortConfig] = useState({ key: 'rank', direction: 'asc' });
   const [trendSortConfig, setTrendSortConfig] = useState({ key: 'diff', direction: 'desc' });
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -61,7 +61,7 @@ const App = () => {
     }
   }, []);
 
-  // 2. 엑셀 라이브러 동적 로드
+  // 2. 엑셀 라이브러리 동적 로드
   useEffect(() => {
     if (!document.querySelector(`script[src="${EXCEL_LIB_URL}"]`)) {
       const script = document.createElement("script");
@@ -81,7 +81,7 @@ const App = () => {
    * 서버(DB)에서 최신 데이터를 가져오는 함수
    */
   const fetchDashboardData = async () => {
-    if (!isAuthorized) return; // 인증되지 않았으면 호출 금지
+    if (!isAuthorized) return; 
     
     setIsFetching(true);
     setHasConnectionError(false);
@@ -272,7 +272,7 @@ const App = () => {
   }, [availableDates]);
 
   /**
-   * 글로벌 날짜 필터가 적용된 파생 데이터 계산
+   * 글로벌 날짜 필터가 적용된 파생 데이터 계산 (ABC 등급 포함)
    */
   const filteredDailyTrend = useMemo(() => {
     if (!globalStartDate || !globalEndDate) return dailyTrend;
@@ -292,10 +292,28 @@ const App = () => {
     return Array.from(monthlyMap.values()).sort((a, b) => a.month.localeCompare(b.month));
   }, [filteredDailyTrend]);
 
+  // 요일별 매출 패턴 계산
+  const weeklyPatternData = useMemo(() => {
+    if (!filteredDailyTrend || filteredDailyTrend.length === 0) return [];
+    
+    const days = ['일', '월', '화', '수', '목', '금', '토'];
+    const pattern = Array(7).fill(0).map((_, i) => ({ day: days[i], 매출: 0, dayIndex: i }));
+
+    filteredDailyTrend.forEach(d => {
+      const dateObj = new Date(d.date);
+      const dayIndex = dateObj.getDay();
+      pattern[dayIndex].매출 += d.매출;
+    });
+
+    return pattern;
+  }, [filteredDailyTrend]);
+
+  // 상품 필터링 및 ABC 등급/비중 계산
   const filteredProducts = useMemo(() => {
     if (!processedData.length || !globalStartDate || !globalEndDate) return processedData;
     
-    return processedData.map(product => {
+    // 1차 필터링 및 기본 데이터 합산
+    const baseFiltered = processedData.map(product => {
       const validHistory = product.history.filter(h => h.date >= globalStartDate && h.date <= globalEndDate);
       const revenue = validHistory.reduce((s, h) => s + h.매출, 0);
       const views = validHistory.reduce((s, h) => s + h.조회수, 0);
@@ -314,7 +332,7 @@ const App = () => {
           cvr: tViews > 0 ? (tSales / tViews) * 100 : 0,
           periodStart: nh.start, periodEnd: nh.end
         };
-      }).filter(p => p.totalViews > 0 || p.totalRevenue > 0); // 선택된 기간에 활동이 있는 이름만
+      }).filter(p => p.totalViews > 0 || p.totalRevenue > 0); 
 
       return {
         ...product,
@@ -326,6 +344,32 @@ const App = () => {
         performanceByName: performanceByName
       };
     }).filter(p => p.상품상세조회수 > 0 || p.결제금액 > 0 || p.결제상품수량 > 0);
+
+    // 전체 매출 및 판매량 계산 (비중 계산용)
+    const totalRevenue = baseFiltered.reduce((sum, p) => sum + p.결제금액, 0);
+    const totalSales = baseFiltered.reduce((sum, p) => sum + p.결제상품수량, 0);
+
+    // 2. 매출액 기준 내림차순 정렬 후 누적 비율 및 ABC 등급 계산
+    const sortedForABC = [...baseFiltered].sort((a, b) => b.결제금액 - a.결제금액);
+    let cumulativeRevenue = 0;
+
+    return sortedForABC.map((p, index) => {
+      cumulativeRevenue += p.결제금액;
+      const cumulativePercent = totalRevenue > 0 ? (cumulativeRevenue / totalRevenue) * 100 : 0;
+      
+      let grade = 'C';
+      if (cumulativePercent <= 70) grade = 'A';
+      else if (cumulativePercent <= 90) grade = 'B';
+
+      return {
+        ...p,
+        rank: index + 1,
+        grade,
+        revenueRatio: totalRevenue > 0 ? (p.결제금액 / totalRevenue) * 100 : 0,
+        salesRatio: totalSales > 0 ? (p.결제상품수량 / totalSales) * 100 : 0
+      };
+    });
+
   }, [processedData, globalStartDate, globalEndDate]);
 
   const summary = useMemo(() => {
@@ -346,8 +390,15 @@ const App = () => {
     );
     if (sortConfig.key) {
       filtered.sort((a, b) => {
-        const valA = Number(a[sortConfig.key]) || 0;
-        const valB = Number(b[sortConfig.key]) || 0;
+        let valA = a[sortConfig.key];
+        let valB = b[sortConfig.key];
+
+        if (typeof valA === 'string' && typeof valB === 'string') {
+            return sortConfig.direction === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+        }
+
+        valA = Number(valA) || 0;
+        valB = Number(valB) || 0;
         return sortConfig.direction === 'asc' ? valA - valB : valB - valA;
       });
     }
@@ -382,7 +433,6 @@ const App = () => {
       const latestRecord = product.history?.find(h => h.date === targetDate);
       const prevRecord = product.history?.find(h => h.date === compareDate);
 
-      // 둘 다 데이터가 없으면 패스 (혹은 한쪽만 있어도 0으로 비교)
       const latestViews = latestRecord ? latestRecord.조회수 : 0;
       const prevViews = prevRecord ? prevRecord.조회수 : 0;
       
@@ -414,7 +464,6 @@ const App = () => {
         const valA = Number(a[trendSortConfig.key]) || 0;
         const valB = Number(b[trendSortConfig.key]) || 0;
         
-        // 변화량 정렬 시, 하락 탭에서는 하락폭(절댓값)이 큰 순서가 먼저 오도록 UX 최적화
         if (trendSortConfig.key === 'diff' && activeTab === 'decreased') {
             return trendSortConfig.direction === 'desc' ? Math.abs(valB) - Math.abs(valA) : Math.abs(valA) - Math.abs(valB);
         }
@@ -451,14 +500,18 @@ const App = () => {
 
     if (activeTab === 'products') {
       exportData = sortedData.map(item => ({
+        '순위': item.rank,
+        '등급': item.grade,
         '상품명': item.lastName || '이름 없음',
         '상품ID': item.상품ID,
-        '조회수': Number(item.상품상세조회수) || 0,
-        '주문량': Number(item.결제상품수량) || 0,
+        '판매량': Number(item.결제상품수량) || 0,
+        '판매비중(%)': Number(item.salesRatio.toFixed(2)),
         '매출액': Number(item.결제금액) || 0,
+        '매출비중(%)': Number(item.revenueRatio.toFixed(2)),
+        '조회수': Number(item.상품상세조회수) || 0,
         '전환율(%)': Number((Number(item.상세조회대비결제율) * 100).toFixed(2))
       }));
-      fileName = '상품분석_목록.xlsx';
+      fileName = '상품분석_ABC등급_리스트.xlsx';
     } else if (activeTab === 'increased' || activeTab === 'decreased') {
       exportData = sortedTrendData.map(item => ({
         '상품명': item.lastName || '이름 없음',
@@ -628,7 +681,7 @@ const App = () => {
           <div className="flex items-center gap-4 text-left">
              <h2 className="text-xl font-black text-slate-900 tracking-tight leading-none text-left">
                {activeTab === 'dashboard' ? '서버 통합 리포트' : 
-                activeTab === 'products' ? '상품별 상세 분석' : 
+                activeTab === 'products' ? '상품별 성과 상세 분석' : 
                 activeTab === 'increased' ? '전날 대비 조회수 상승 상품' : 
                 '전날 대비 조회수 하락 상품'}
              </h2>
@@ -743,9 +796,54 @@ const App = () => {
                         <AreaChart data={filteredDailyTrend}>
                           <defs><linearGradient id="colorViewsMain" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10B981" stopOpacity={0.2}/><stop offset="95%" stopColor="#10B981" stopOpacity={0}/></linearGradient></defs>
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" /><XAxis dataKey="date" hide /><YAxis hide /><Tooltip contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 25px 50px -12px rgb(0 0 0 / 0.25)'}} />
-                          <Area name="일일 조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorViewsMain)" />
+                          <Area name="일일 조회수" type="monotone" dataKey="조회수" stroke="#10B981" strokeWidth={5} fillOpacity={1} fill="url(#colorViewsMain)" activeDot={{r: 6}} />
                         </AreaChart>
                       </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* 새롭게 추가된 2단 그리드: 일별 매출 추이 & 요일별 매출 패턴 */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 text-left">
+                    {/* 일별 매출 추이 */}
+                    <div className="lg:col-span-2 bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                      <h3 className="font-black text-lg flex items-center gap-3 text-blue-500 mb-10 text-left">
+                        <div className="w-1.5 h-6 bg-blue-400 rounded-full text-left"></div> 일별 매출 추이
+                      </h3>
+                      <div className="h-72 text-left">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart data={filteredDailyTrend}>
+                            <defs><linearGradient id="colorRevenueMain" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3B82F6" stopOpacity={0.2}/><stop offset="95%" stopColor="#3B82F6" stopOpacity={0}/></linearGradient></defs>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" />
+                            <XAxis dataKey="date" tickLine={false} axisLine={false} tick={{fontSize: 12, fill: '#94A3B8', fontWeight: 600}} dy={10} />
+                            <YAxis hide />
+                            <Tooltip formatter={(value) => `₩${value.toLocaleString()}`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 25px 50px -12px rgb(0 0 0 / 0.25)'}} />
+                            <Area name="매출액" type="monotone" dataKey="매출" stroke="#3B82F6" strokeWidth={4} fillOpacity={1} fill="url(#colorRevenueMain)" activeDot={{r: 6}} />
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    {/* 요일별 매출 패턴 */}
+                    <div className="bg-white p-10 rounded-[48px] border border-slate-100 shadow-xl text-left">
+                      <h3 className="font-black text-lg flex items-center gap-3 text-orange-500 mb-10 text-left">
+                        <div className="w-1.5 h-6 bg-orange-400 rounded-full text-left"></div> 요일별 매출 패턴
+                      </h3>
+                      <div className="h-72 text-left">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={weeklyPatternData}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" />
+                            <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{fontSize: 14, fill: '#94A3B8', fontWeight: 800}} dy={10} />
+                            <YAxis hide />
+                            <Tooltip cursor={{fill: '#FFF7ED', radius: 12}} formatter={(value) => `₩${value.toLocaleString()}`} contentStyle={{borderRadius: '24px', border: 'none', boxShadow: '0 10px 25px -5px rgb(0 0 0 / 0.1)'}} />
+                            <Bar name="총 매출 합계" dataKey="매출" radius={[8, 8, 0, 0]} barSize={40}>
+                              {weeklyPatternData.map((entry, index) => {
+                                const maxSales = Math.max(...weeklyPatternData.map(d => d.매출));
+                                return <Cell key={`cell-${index}`} fill={entry.매출 === maxSales ? '#F97316' : '#FFEDD5'} />;
+                              })}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -753,6 +851,20 @@ const App = () => {
 
               {activeTab === 'products' && (
                 <div className="bg-white rounded-[48px] border border-slate-100 shadow-2xl overflow-hidden animate-in zoom-in-95 duration-500 flex flex-col text-left">
+                  
+                  {/* 상단 타이틀 및 ABC 범례 */}
+                  <div className="p-8 bg-white border-b border-slate-50 text-left flex flex-col lg:flex-row items-center justify-between gap-6">
+                    <div className="flex items-center gap-4 text-left">
+                      <ListOrdered size={24} className="text-slate-400" />
+                      <h3 className="font-black text-2xl text-slate-800 tracking-tight">상품별 성과 전체 리스트 <span className="text-emerald-600 text-lg">(ABC 등급)</span></h3>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-4 bg-slate-50 px-6 py-3 rounded-2xl text-xs font-bold text-slate-600">
+                      <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-yellow-400 shadow-sm"></span> A등급: 누적매출 0~70% (주력)</div>
+                      <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-blue-500 shadow-sm"></span> B등급: 누적매출 70~90% (일반)</div>
+                      <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-slate-300 shadow-sm"></span> C등급: 하위 10% (관리필요)</div>
+                    </div>
+                  </div>
+
                   <div className="p-8 bg-slate-50/40 flex flex-col md:flex-row gap-6 border-b border-slate-50 text-left">
                     <div className="relative flex-1 group text-left">
                       <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 transition-colors text-left" size={20} />
@@ -770,28 +882,67 @@ const App = () => {
                   <div className="overflow-x-auto text-left">
                     <table className="w-full text-left">
                       <thead>
-                        <tr className="border-b border-slate-50 text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-50/20 text-left">
-                          <th className="px-10 py-6 text-left">상품 정보</th>
-                          <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상품상세조회수')}>조회수</th>
-                          <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제상품수량')}>주문량</th>
-                          <th className="px-6 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제금액')}>매출액</th>
-                          <th className="px-10 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상세조회대비결제율')}>전환율</th>
+                        <tr className="border-b border-slate-50 text-[11px] font-black text-slate-400 uppercase tracking-widest bg-slate-50/20 text-left">
+                          <th className="px-6 py-6 text-center cursor-pointer hover:text-emerald-600" onClick={() => handleSort('rank')}>순위</th>
+                          <th className="px-4 py-6 text-center cursor-pointer hover:text-emerald-600" onClick={() => handleSort('grade')}>등급</th>
+                          <th className="px-6 py-6 text-left">상품정보</th>
+                          <th className="px-6 py-6 text-right cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제상품수량')}>판매량</th>
+                          <th className="px-8 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('salesRatio')}>판매비중</th>
+                          <th className="px-6 py-6 text-right cursor-pointer hover:text-emerald-600" onClick={() => handleSort('결제금액')}>매출액</th>
+                          <th className="px-8 py-6 text-left cursor-pointer hover:text-emerald-600" onClick={() => handleSort('revenueRatio')}>매출비중</th>
+                          <th className="px-6 py-6 text-right cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상품상세조회수')}>조회수</th>
+                          <th className="px-6 py-6 text-right cursor-pointer hover:text-emerald-600" onClick={() => handleSort('상세조회대비결제율')}>전환율</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50 text-left">
                         {sortedData.slice(0, visibleCount).map((item, idx) => (
-                          <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer text-left" onClick={() => setSelectedProduct(item)}>
-                            <td className="px-10 py-8 min-w-[350px] text-left">
+                          <tr key={idx} className="hover:bg-slate-50/50 cursor-pointer text-left transition-colors" onClick={() => setSelectedProduct(item)}>
+                            {/* 순위 */}
+                            <td className="px-6 py-8 text-center text-slate-700 font-bold">
+                              {item.rank === 1 ? <span className="text-xl">🥇</span> : 
+                               item.rank === 2 ? <span className="text-xl">🥈</span> : 
+                               item.rank === 3 ? <span className="text-xl">🥉</span> : item.rank}
+                            </td>
+                            {/* 등급 */}
+                            <td className="px-4 py-8 text-center">
+                              <span className={`px-4 py-1.5 rounded-lg font-black text-sm shadow-sm ${item.grade === 'A' ? 'bg-yellow-100 text-yellow-700 border border-yellow-200' : item.grade === 'B' ? 'bg-blue-100 text-blue-700 border border-blue-200' : 'bg-slate-100 text-slate-600 border border-slate-200'}`}>
+                                {item.grade}
+                              </span>
+                            </td>
+                            {/* 상품정보 */}
+                            <td className="px-6 py-8 min-w-[300px] text-left">
                               <div className="font-black text-slate-900 group-hover:text-emerald-600 transition-colors text-left leading-relaxed">
                                 {String(item.lastName || '이름 없음')} {Number(item.nameCount) > 1 && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded font-black mt-1 uppercase text-left">MODIFIED</span>}
                               </div>
                               <div className="text-[10px] text-slate-400 mt-2 font-black tracking-widest uppercase text-left">ID: {String(item.상품ID || '')}</div>
                             </td>
-                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(Number(item.상품상세조회수) || 0).toLocaleString()}</td>
-                            <td className="px-6 py-8 font-black text-slate-700 text-left">{(Number(item.결제상품수량) || 0).toLocaleString()}</td>
-                            <td className="px-6 py-8 font-black text-slate-900 italic text-left">₩{(Number(item.결제금액) || 0).toLocaleString()}</td>
-                            <td className="px-10 py-8 text-left">
-                              <span className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-lg text-xs font-black text-left">
+                            {/* 판매량 */}
+                            <td className="px-6 py-8 font-black text-slate-700 text-right">{(Number(item.결제상품수량) || 0).toLocaleString()}</td>
+                            {/* 판매비중 막대 */}
+                            <td className="px-8 py-8 min-w-[150px]">
+                              <div className="flex items-center gap-3">
+                                <span className="text-xs font-bold text-slate-500 w-10 text-right">{item.salesRatio.toFixed(1)}%</span>
+                                <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden shadow-inner">
+                                  <div className={`h-full rounded-full transition-all duration-1000 ${item.grade === 'A' ? 'bg-yellow-400' : item.grade === 'B' ? 'bg-blue-500' : 'bg-slate-300'}`} style={{ width: `${item.salesRatio}%` }}></div>
+                                </div>
+                              </div>
+                            </td>
+                            {/* 매출액 */}
+                            <td className="px-6 py-8 font-black text-slate-900 italic text-right">₩{(Number(item.결제금액) || 0).toLocaleString()}</td>
+                            {/* 매출비중 막대 */}
+                            <td className="px-8 py-8 min-w-[150px]">
+                              <div className="flex items-center gap-3">
+                                <span className="text-xs font-bold text-slate-500 w-10 text-right">{item.revenueRatio.toFixed(1)}%</span>
+                                <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden shadow-inner">
+                                  <div className={`h-full rounded-full transition-all duration-1000 ${item.grade === 'A' ? 'bg-emerald-500' : item.grade === 'B' ? 'bg-emerald-400' : 'bg-slate-300'}`} style={{ width: `${item.revenueRatio}%` }}></div>
+                                </div>
+                              </div>
+                            </td>
+                            {/* 조회수 */}
+                            <td className="px-6 py-8 font-black text-slate-500 text-right">{(Number(item.상품상세조회수) || 0).toLocaleString()}</td>
+                            {/* 전환율 */}
+                            <td className="px-6 py-8 text-right">
+                              <span className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-lg text-xs font-black">
                                 {(Number(item.상세조회대비결제율) * 100).toFixed(2)}%
                               </span>
                             </td>
